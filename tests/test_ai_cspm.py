@@ -1910,3 +1910,29 @@ def test_load_env_secret_dotenv_syntax_and_no_parent_leak(tmp_path, monkeypatch)
     child.mkdir()
     monkeypatch.chdir(child)
     assert load_env_secret("CSPM_TEST_KEY", "dflt") == "dflt"
+
+
+# --- Live-mode safety: a failed scan must never be reported as secure ----------
+def test_live_mode_fails_closed_on_bad_credentials(monkeypatch):
+    import ai_cspm
+
+    class BadSession:
+        def client(self, name):
+            raise RuntimeError("endpoint unreachable")
+
+    monkeypatch.setattr(ai_cspm, "_resolve_aws_session", lambda f, p, r: (BadSession(), "eu-north-1", False))
+    assert ai_cspm.run_scan(live_mode=True, offline_mode=True, format_type="json") == 2
+
+
+def test_live_mode_uses_env_credentials_without_wizard(monkeypatch):
+    import ai_cspm
+
+    monkeypatch.setenv("AWS_ACCESS_KEY_ID", "AKIAFAKEFAKEFAKEFAKE")
+    monkeypatch.setenv("AWS_SECRET_ACCESS_KEY", "x" * 40)
+
+    class Boom:
+        def prompt_aws_configuration(self, **kw):
+            raise AssertionError("interactive wizard must not run when env credentials exist")
+
+    sess, region, is_demo = ai_cspm._resolve_aws_session(Boom(), None, "eu-north-1")
+    assert sess is not None and region == "eu-north-1" and is_demo is False

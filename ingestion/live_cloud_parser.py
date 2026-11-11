@@ -255,7 +255,7 @@ class LiveCloudFetcher:
             console.print("  [bold green][1][/] Enter AWS Access Key & Secret manually")
             console.print("  [bold green][2][/] Use Simulated Live Enterprise Cloud (Offline / Graduation Demo Mode)")
             
-            choice = self._safe_prompt("Choose authentication method", choices=["1", "2"], default="2")
+            choice = self._safe_prompt("Choose authentication method", choices=["1", "2"], default="1")
             if choice == "1":
                 ak = self._safe_prompt("AWS Access Key ID")
                 sk = self._safe_prompt("AWS Secret Access Key", password=True)

@@ -61,6 +61,30 @@ def print_banner():
     console.print(banner)
 
 
+def _verify_aws_credentials(session):
+    """Calls sts:GetCallerIdentity. Returns (ok, ARN-or-error-message)."""
+    try:
+        ident = session.client("sts").get_caller_identity()
+        return True, ident.get("Arn", "unknown")
+    except Exception as exc:  # network failure, invalid/expired keys, etc.
+        return False, f"{type(exc).__name__}: {str(exc)[:300]}"
+
+
+def _resolve_aws_session(fetcher, aws_profile, aws_region):
+    """Uses the standard boto3 credential chain (env vars, SSO, instance role) when no
+    profile is given; falls back to the interactive wizard only if nothing is configured."""
+    if not aws_profile:
+        try:
+            import boto3
+            region = aws_region or os.environ.get("AWS_DEFAULT_REGION") or os.environ.get("AWS_REGION") or "us-east-1"
+            sess = boto3.Session(region_name=region)
+            if sess.get_credentials() is not None:
+                return sess, region, False
+        except Exception:
+            pass
+    return fetcher.prompt_aws_configuration(cli_profile=aws_profile, cli_region=aws_region)
+
+
 def run_scan(
     target_dir: Optional[str] = None,
     output_path: Optional[str] = None,
@@ -95,10 +119,14 @@ def run_scan(
             fetcher.fetch_simulated_live_assets(region=aws_region or "us-east-1")
             source_description = "Live Cloud Environment (Simulated Enterprise AWS & EKS Cluster)"
         else:
-            session, region, is_demo = fetcher.prompt_aws_configuration(
-                cli_profile=aws_profile,
-                cli_region=aws_region
-            )
+            session, region, is_demo = _resolve_aws_session(fetcher, aws_profile, aws_region)
+            if session is not None:
+                ok, detail = _verify_aws_credentials(session)
+                if not ok:
+                    console.print(f"[bold red]✖ AWS authentication failed:[/] {detail}")
+                    console.print("[red]No report was produced: a failed scan must never be reported as secure.[/]")
+                    return 2
+                console.print(f"[bold green]✔ Authenticated to AWS as:[/] {detail}")
             k8s_ctx, k8s_ns = fetcher.prompt_k8s_configuration(
                 cli_context=kube_context,
                 cli_namespace=k8s_namespace,
@@ -112,6 +140,13 @@ def run_scan(
                 if session:
                     fetcher.fetch_aws_live_assets(session, region)
                 fetcher.fetch_k8s_live_assets(context_name=k8s_ctx, namespace=k8s_ns)
+                if not (fetcher.roles or fetcher.policies or fetcher.kms_keys or fetcher.s3_buckets or fetcher.workloads):
+                    console.print("[bold red]✖ SCAN INCOMPLETE: no assets were collected.[/]")
+                    console.print("[red]Check network access and read permissions (SecurityAudit + ViewOnlyAccess). "
+                                  "If the account is genuinely empty this is expected. No 'secure' verdict is issued.[/]")
+                    for w in list(getattr(fetcher, "warnings", []))[:10]:
+                        console.print(f"  [yellow]⚠ {w}[/]")
+                    return 2
                 source_description = f"Live AWS ({region}) & K8s Context ({k8s_ctx or 'active'}:{k8s_ns})"
 
         if format_type == "console":
