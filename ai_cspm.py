@@ -119,14 +119,16 @@ def run_scan(
             fetcher.fetch_simulated_live_assets(region=aws_region or "us-east-1")
             source_description = "Live Cloud Environment (Simulated Enterprise AWS & EKS Cluster)"
         else:
+            err_console = console if format_type == "console" else Console(stderr=True, highlight=False, emoji=False)
             session, region, is_demo = _resolve_aws_session(fetcher, aws_profile, aws_region)
             if session is not None:
                 ok, detail = _verify_aws_credentials(session)
                 if not ok:
-                    console.print(f"[bold red]✖ AWS authentication failed:[/] {detail}")
-                    console.print("[red]No report was produced: a failed scan must never be reported as secure.[/]")
+                    err_console.print(f"[bold red]✖ AWS authentication failed:[/] {detail}")
+                    err_console.print("[red]No report was produced: a failed scan must never be reported as secure.[/]")
                     return 2
-                console.print(f"[bold green]✔ Authenticated to AWS as:[/] {detail}")
+                if format_type == "console":
+                    console.print(f"[bold green]✔ Authenticated to AWS as:[/] {detail}")
             k8s_ctx, k8s_ns = fetcher.prompt_k8s_configuration(
                 cli_context=kube_context,
                 cli_namespace=k8s_namespace,
@@ -141,11 +143,11 @@ def run_scan(
                     fetcher.fetch_aws_live_assets(session, region)
                 fetcher.fetch_k8s_live_assets(context_name=k8s_ctx, namespace=k8s_ns)
                 if not (fetcher.roles or fetcher.policies or fetcher.kms_keys or fetcher.s3_buckets or fetcher.workloads):
-                    console.print("[bold red]✖ SCAN INCOMPLETE: no assets were collected.[/]")
-                    console.print("[red]Check network access and read permissions (SecurityAudit + ViewOnlyAccess). "
-                                  "If the account is genuinely empty this is expected. No 'secure' verdict is issued.[/]")
+                    err_console.print("[bold red]✖ SCAN INCOMPLETE: no assets were collected.[/]")
+                    err_console.print("[red]Check network access and read permissions (SecurityAudit + ViewOnlyAccess). "
+                                      "If the account is genuinely empty this is expected. No 'secure' verdict is issued.[/]")
                     for w in list(getattr(fetcher, "warnings", []))[:10]:
-                        console.print(f"  [yellow]⚠ {w}[/]")
+                        err_console.print(f"  [yellow]⚠ {w}[/]")
                     return 2
                 source_description = f"Live AWS ({region}) & K8s Context ({k8s_ctx or 'active'}:{k8s_ns})"
 

@@ -14,6 +14,7 @@ try:
         SYSTEM_REMEDIATION_PROMPT,
         generate_remediation_user_prompt,
         load_env_secret,
+        load_gemini_config,
         parse_llm_json_response,
         extract_target_refs,
         detect_attack_path_vector,
@@ -26,6 +27,7 @@ except (ImportError, ValueError):
         SYSTEM_REMEDIATION_PROMPT,
         generate_remediation_user_prompt,
         load_env_secret,
+        load_gemini_config,
         parse_llm_json_response,
         extract_target_refs,
         detect_attack_path_vector,
@@ -39,8 +41,7 @@ class AIRemediationEngine:
         self.provider = model_provider
         self.offline_mode = offline_mode
         self.gemini_key = "" if offline_mode else load_env_secret("GEMINI_API_KEY")
-        self.model_name = load_env_secret("GEMINI_MODEL", "gemini-flash-lite-latest")
-        self.timeout = int(load_env_secret("GEMINI_TIMEOUT", "25") or 25)
+        self.model_name, self.timeout = load_gemini_config()
         self.api_endpoint = f"https://generativelanguage.googleapis.com/v1beta/models/{self.model_name}:generateContent"
         self.last_error: Optional[str] = None
         self.last_provider: str = "Deterministic Contextual Core"

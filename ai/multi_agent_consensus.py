@@ -13,12 +13,14 @@ from typing import Dict, Any, Optional
 try:
     from ai.prompt_templates import (
         load_env_secret,
+        load_gemini_config,
         parse_llm_json_response,
         build_scoped_kms_policy_hcl,
     )
 except (ImportError, ValueError):
     from .prompt_templates import (
         load_env_secret,
+        load_gemini_config,
         parse_llm_json_response,
         build_scoped_kms_policy_hcl,
     )
@@ -28,8 +30,7 @@ class MultiAgentConsensusEngine:
     def __init__(self, api_key: Optional[str] = None, offline_mode: bool = False):
         self.offline_mode = offline_mode
         self.gemini_key = "" if offline_mode else (api_key or load_env_secret("GEMINI_API_KEY"))
-        self.model_name = load_env_secret("GEMINI_MODEL", "gemini-flash-lite-latest")
-        self.timeout = int(load_env_secret("GEMINI_TIMEOUT", "25") or 25)
+        self.model_name, self.timeout = load_gemini_config()
         self.api_endpoint = f"https://generativelanguage.googleapis.com/v1beta/models/{self.model_name}:generateContent"
         self.last_error: Optional[str] = None
 

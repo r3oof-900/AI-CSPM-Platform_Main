@@ -1936,3 +1936,42 @@ def test_live_mode_uses_env_credentials_without_wizard(monkeypatch):
 
     sess, region, is_demo = ai_cspm._resolve_aws_session(Boom(), None, "eu-north-1")
     assert sess is not None and region == "eu-north-1" and is_demo is False
+
+
+def test_live_json_stdout_clean_and_gemini_timeout_fallback(tmp_path, monkeypatch, capsys):
+    import ai_cspm
+    from ai.prompt_templates import load_gemini_config, _parse_dotenv_fallback
+
+    # 0. Fallback .env parser works even if python-dotenv is absent
+    env_p = tmp_path / ".env"
+    env_p.write_text('# comment\nexport FOO = "bar"  # inline\nBAZ=qux # tail\n', encoding="utf-8")
+    assert _parse_dotenv_fallback(str(env_p)) == {"FOO": "bar", "BAZ": "qux"}
+
+    # 1. Invalid GEMINI_TIMEOUT does not crash engine construction
+    monkeypatch.setenv("GEMINI_TIMEOUT", "invalid-number")
+    monkeypatch.setenv("GEMINI_MODEL", "gemini-2.5-flash")
+    model, tout = load_gemini_config()
+    assert model == "gemini-2.5-flash" and tout == 25
+
+    # 2. Live mode with -f json keeps stdout strictly parseable JSON (no Authenticated banner)
+    class FakeSTS:
+        def get_caller_identity(self):
+            return {"Arn": "arn:aws:iam::111122223333:user/auditor"}
+
+    class FakeSession:
+        def client(self, name, **kw):
+            return FakeSTS()
+
+    def fake_aws_fetch(self, sess, region):
+        self.roles.append(IAMRoleNode(id="r1", name="AppRole", role_arn="arn:aws:iam::111122223333:role/AppRole"))
+
+    monkeypatch.setattr(ai_cspm, "_resolve_aws_session", lambda f, p, r: (FakeSession(), "eu-north-1", False))
+    monkeypatch.setattr(LiveCloudFetcher, "fetch_aws_live_assets", fake_aws_fetch)
+    monkeypatch.setattr(LiveCloudFetcher, "fetch_k8s_live_assets", lambda self, context_name=None, namespace="default": None)
+    capsys.readouterr()
+    rc = ai_cspm.run_scan(live_mode=True, offline_mode=True, format_type="json", fail_on="attack-path")
+    assert rc == 0
+    captured = capsys.readouterr()
+    assert "Authenticated to AWS" not in captured.out
+    parsed = json.loads(captured.out)
+    assert parsed["metrics"]["total_assets"] == 1

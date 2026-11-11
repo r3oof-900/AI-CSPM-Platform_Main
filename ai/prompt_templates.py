@@ -23,12 +23,42 @@ Guiding Principles:
 _PROJECT_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 
 
+def _parse_dotenv_fallback(path: str) -> Dict[str, str]:
+    """Minimal fallback parser for .env files when python-dotenv is absent."""
+    result: Dict[str, str] = {}
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            for raw in f:
+                line = raw.strip()
+                if not line or line.startswith("#"):
+                    continue
+                if line.startswith("export "):
+                    line = line[len("export "):].lstrip()
+                if "=" not in line:
+                    continue
+                key, val = line.split("=", 1)
+                key = key.strip()
+                val = val.strip()
+                if not key:
+                    continue
+                if len(val) >= 1 and val[0] in ('"', "'"):
+                    q = val[0]
+                    mq = re.match(rf"^{re.escape(q)}(.*?){re.escape(q)}(?:\s+#.*|\s*)$", val)
+                    val = mq.group(1) if mq else val.strip(q)
+                else:
+                    val = re.sub(r"\s+#.*$", "", val).strip()
+                result[key] = val
+    except OSError:
+        return {}
+    return result
+
+
 def _read_dotenv(path: str) -> Dict[str, str]:
     """Parses a .env file with python-dotenv (handles export, spaces, quotes, comments)."""
     try:
         from dotenv import dotenv_values
-    except ImportError:  # python-dotenv is optional at runtime; real env vars still work
-        return {}
+    except ImportError:
+        return _parse_dotenv_fallback(path)
     try:
         return {k: v for k, v in dotenv_values(path).items() if v is not None}
     except OSError:
@@ -51,6 +81,17 @@ def load_env_secret(var_name: str, default: str = "") -> str:
             if found:
                 return found.strip()
     return default
+
+
+def load_gemini_config() -> Tuple[str, int]:
+    """Loads (model_name, timeout_seconds) safely from env/.env with validation."""
+    model_name = load_env_secret("GEMINI_MODEL", "gemini-flash-lite-latest") or "gemini-flash-lite-latest"
+    raw_timeout = load_env_secret("GEMINI_TIMEOUT", "25")
+    try:
+        timeout = max(1, int(raw_timeout))
+    except (TypeError, ValueError):
+        timeout = 25
+    return model_name, timeout
 
 
 def parse_llm_json_response(raw_text: str) -> Dict[str, Any]:
