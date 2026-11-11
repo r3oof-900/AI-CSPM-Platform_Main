@@ -28,7 +28,8 @@ class MultiAgentConsensusEngine:
     def __init__(self, api_key: Optional[str] = None, offline_mode: bool = False):
         self.offline_mode = offline_mode
         self.gemini_key = "" if offline_mode else (api_key or load_env_secret("GEMINI_API_KEY"))
-        self.model_name = "gemini-flash-lite-latest"
+        self.model_name = load_env_secret("GEMINI_MODEL", "gemini-flash-lite-latest")
+        self.timeout = int(load_env_secret("GEMINI_TIMEOUT", "25") or 25)
         self.api_endpoint = f"https://generativelanguage.googleapis.com/v1beta/models/{self.model_name}:generateContent"
         self.last_error: Optional[str] = None
 
@@ -154,7 +155,7 @@ Return ONLY a valid JSON object matching this schema:
             "Content-Type": "application/json",
             "X-goog-api-key": self.gemini_key
         }
-        resp = requests.post(self.api_endpoint, headers=headers, json=payload, timeout=25)
+        resp = requests.post(self.api_endpoint, headers=headers, json=payload, timeout=self.timeout)
         if resp.status_code == 200:
             data = resp.json()
             raw_text = data["candidates"][0]["content"]["parts"][0]["text"]

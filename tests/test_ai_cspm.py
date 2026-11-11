@@ -1889,3 +1889,24 @@ resource "aws_iam_policy" "pol" {
     assert run_scan(target_dir=fraud_dir, offline_mode=True, format_type="console", fail_on="critical") == 1
     console_text = capsys.readouterr().out
     assert "\U0001f202" not in console_text
+
+
+# --- Env loader hardening -----------------------------------------------------
+def test_load_env_secret_dotenv_syntax_and_no_parent_leak(tmp_path, monkeypatch):
+    from ai.prompt_templates import load_env_secret
+
+    monkeypatch.delenv("CSPM_TEST_KEY", raising=False)
+    (tmp_path / ".env").write_text('# c\nexport CSPM_TEST_KEY = "abc123"  # inline\n', encoding="utf-8")
+    monkeypatch.chdir(tmp_path)
+    assert load_env_secret("CSPM_TEST_KEY") == "abc123"
+
+    # real environment variable wins over .env
+    monkeypatch.setenv("CSPM_TEST_KEY", "from-env")
+    assert load_env_secret("CSPM_TEST_KEY") == "from-env"
+
+    # a .env in a PARENT directory must not be picked up
+    monkeypatch.delenv("CSPM_TEST_KEY", raising=False)
+    child = tmp_path / "child"
+    child.mkdir()
+    monkeypatch.chdir(child)
+    assert load_env_secret("CSPM_TEST_KEY", "dflt") == "dflt"

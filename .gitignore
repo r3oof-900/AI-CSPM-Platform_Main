@@ -1,4 +1,38 @@
+# Secrets - NEVER commit
+.env
+.env.*
+!.env.example
+*.pem
+*.key
+
+# Python
 __pycache__/
 *.py[cod]
 *$py.class
 .pytest_cache/
+.venv/
+venv/
+*.egg-info/
+dist/
+build/
+
+# Terraform / state
+.terraform/
+*.tfstate
+*.tfstate.*
+*.tfvars
+crash.log
+
+# Tool output & backups
+*.backup
+*.bak
+reports/
+cspm_report*.json
+cspm_report*.html
+attack_graph*.html
+remediated_*.tf
+
+# Editors / OS
+.idea/
+.vscode/
+.DS_Store

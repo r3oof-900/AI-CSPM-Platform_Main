@@ -20,21 +20,37 @@ Guiding Principles:
 """
 
 
-def load_env_secret(var_name: str) -> str:
-    """Reads secret from environment or local .env file."""
-    val = os.getenv(var_name, "")
-    if not val:
-        cur = os.path.dirname(os.path.abspath(__file__))
-        for _ in range(4):
-            env_file = os.path.join(cur, ".env")
-            if os.path.exists(env_file):
-                with open(env_file, "r", encoding="utf-8") as f:
-                    for line in f:
-                        line = line.strip()
-                        if line and not line.startswith("#") and line.startswith(f"{var_name}="):
-                            return line.split("=", 1)[1].strip().strip('"').strip("'")
-            cur = os.path.dirname(cur)
-    return val
+_PROJECT_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+
+
+def _read_dotenv(path: str) -> Dict[str, str]:
+    """Parses a .env file with python-dotenv (handles export, spaces, quotes, comments)."""
+    try:
+        from dotenv import dotenv_values
+    except ImportError:  # python-dotenv is optional at runtime; real env vars still work
+        return {}
+    try:
+        return {k: v for k, v in dotenv_values(path).items() if v is not None}
+    except OSError:
+        return {}
+
+
+def load_env_secret(var_name: str, default: str = "") -> str:
+    """
+    Reads a setting from the process environment, then from a .env file.
+    The .env lookup is limited to the current working directory and the project root,
+    so an unrelated .env in a parent directory is never picked up.
+    """
+    val = os.getenv(var_name)
+    if val:
+        return val
+    for base in dict.fromkeys([os.getcwd(), _PROJECT_ROOT]):
+        env_file = os.path.join(base, ".env")
+        if os.path.isfile(env_file):
+            found = _read_dotenv(env_file).get(var_name, "")
+            if found:
+                return found.strip()
+    return default
 
 
 def parse_llm_json_response(raw_text: str) -> Dict[str, Any]:
