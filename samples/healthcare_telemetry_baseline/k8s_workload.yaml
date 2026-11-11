@@ -1,0 +1,36 @@
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: telemetry
+
+---
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: telemetry-sa
+  namespace: telemetry
+  annotations:
+    eks.amazonaws.com/role-arn: arn:aws:iam::999888777666:role/healthcare_telemetry_iam_role
+
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: patient-telemetry-collector
+  namespace: telemetry
+spec:
+  replicas: 2
+  selector:
+    matchLabels:
+      app: telemetry-collector
+  template:
+    metadata:
+      labels:
+        app: telemetry-collector
+    spec:
+      serviceAccountName: telemetry-sa
+      containers:
+      - name: collector-engine
+        image: custom-telemetry:3.1
+        ports:
+        - containerPort: 9090

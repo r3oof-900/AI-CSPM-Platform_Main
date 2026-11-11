@@ -1,0 +1,19 @@
+{
+  "Version": "2012-10-17",
+  "Statement": [
+    {
+      "Sid": "ScopedPaymentKmsDecryptionPolicy",
+      "Effect": "Allow",
+      "Action": [
+        "kms:Decrypt",
+        "kms:DescribeKey"
+      ],
+      "Resource": "arn:aws:kms:eu-north-1:853679583136:key/payment-vault-cmk",
+      "Condition": {
+        "StringEquals": {
+          "kms:EncryptionContext:aws:s3:arn": "arn:aws:s3:::payment-vault-853679583136-production"
+        }
+      }
+    }
+  ]
+}
