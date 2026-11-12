@@ -5,18 +5,21 @@ AI-CSPM Prompt Templates & Shared AI Helpers for Contextual Least-Privilege Reme
 import os
 import re
 import json
-from typing import Dict, Any, Tuple
+import time
+from typing import Dict, Any, Tuple, Optional
 
 
 SYSTEM_REMEDIATION_PROMPT = """You are AI-CSPM, an advanced cloud security reasoning agent specializing in Multi-Tier Cloud & Kubernetes architectures.
-Your task is to analyze cross-layer attack paths (Kubernetes Workload -> Cloud IAM Role -> KMS CMK -> Storage Vault) and synthesize strictly scoped, least-privilege Infrastructure-as-Code (Terraform HCL) remediations.
+Your task is to analyze cross-layer attack paths (Kubernetes Workload -> Cloud IAM Role -> Policy / KMS / Storage Vault) and synthesize strictly scoped, least-privilege Infrastructure-as-Code (Terraform HCL) remediations.
 
 Guiding Principles:
-1. Eliminate all wildcard '*' grants on high-impact actions like kms:Decrypt, kms:Encrypt, and kms:DescribeKey.
-2. Scope the 'Resource' field strictly to the explicit ARN of the authorized Customer Managed Key (CMK).
-3. Enforce cryptographic conditions using 'kms:EncryptionContext' to bind decryption exclusively to the authorized S3 bucket.
-4. Provide a clear threat narrative explaining why single-layer scanners (like Prowler, Checkov, and Access Analyzer) missed this threat.
-5. Format the output with clear 'Original Flawed Code', 'Remediated Scoped Code', and 'Architectural Justification'.
+1. Match the Terraform resource type to the exact attack vector:
+   - For 'iam_policy': remediate 'aws_iam_policy', replace wildcard Resource '*' with the exact CMK ARN, and enforce 'kms:EncryptionContext:aws:s3:arn'.
+   - For 'kms_resource_policy': remediate 'aws_kms_key', restrict Principal to the exact authorized IAM Role ARN, and enforce 'kms:EncryptionContext' or 'kms:ViaService'.
+   - For 's3_resource_policy': remediate 'aws_s3_bucket_policy', replace Principal '*' with the exact authorized IAM Role ARN (do NOT invent KMS keys or aws_iam_policy), and enforce 'aws:PrincipalArn'.
+2. Copy every provided ARN, resource name, and bucket name VERBATIM from [VERIFIED GRAPH IDENTIFIERS]. Never invent, truncate, or alter UUIDs or IAM role paths.
+3. Eliminate all un-scoped wildcard '*' grants in Resource or Principal.
+4. Provide a clear threat narrative explaining why single-layer scanners (Prowler, Checkov, AWS Access Analyzer, Kubescape) missed this cross-layer path.
 """
 
 
@@ -319,8 +322,198 @@ resource "aws_s3_bucket_policy" "scoped_{bucket_tf_ident}_policy" {{
 }}"""
 
 
+def extract_verified_refs(nodes: list) -> Dict[str, Any]:
+    """Extracts exact verified names, ARNs, and S3 allowed actions from attack path node dicts."""
+    refs: Dict[str, Any] = {
+        "vector_type": detect_attack_path_vector(nodes),
+        "workload_name": "compromised-workload",
+        "policy_name": None,
+        "role_name": None,
+        "role_arn": None,
+        "key_name": None,
+        "key_arn": None,
+        "bucket_name": None,
+        "bucket_arn": None,
+        "allowed_actions": None,
+        "use_explicit_arns": False,
+    }
+    has_tf = False
+    has_live_or_json_arn = False
+    for n in nodes or []:
+        src = str(n.get("source_file") or "").lower()
+        if src.endswith(".tf"):
+            has_tf = True
+        elif src.startswith(("aws://", "k8s://", "kubectl://")) or (
+            src.endswith(".json") and (n.get("key_arn") or n.get("bucket_arn") or n.get("role_arn"))
+        ):
+            has_live_or_json_arn = True
+
+        ntype = str(n.get("type", ""))
+        if ntype in ("WORKLOAD", "NodeType.WORKLOAD"):
+            refs["workload_name"] = n.get("name") or refs["workload_name"]
+        elif ntype in ("IAM_ROLE", "NodeType.IAM_ROLE"):
+            refs["role_name"] = n.get("name") or refs["role_name"]
+            refs["role_arn"] = n.get("role_arn") or refs["role_arn"]
+        elif ntype in ("IAM_POLICY", "NodeType.IAM_POLICY"):
+            refs["policy_name"] = n.get("name") or refs["policy_name"]
+        elif ntype in ("KMS_KEY", "NodeType.KMS_KEY"):
+            refs["key_name"] = n.get("name") or refs["key_name"]
+            refs["key_arn"] = n.get("key_arn") or refs["key_arn"]
+        elif ntype in ("S3_BUCKET", "NodeType.S3_BUCKET"):
+            refs["bucket_name"] = n.get("bucket_name") or n.get("name") or refs["bucket_name"]
+            refs["bucket_arn"] = n.get("bucket_arn") or refs["bucket_arn"]
+            if n.get("allowed_actions"):
+                refs["allowed_actions"] = list(n["allowed_actions"])
+    refs["use_explicit_arns"] = has_live_or_json_arn and not has_tf
+    return refs
+
+
+_VECTOR_GUIDANCE = {
+    "s3_resource_policy": (
+        "1. Synthesize ONLY an 'aws_s3_bucket_policy' Terraform HCL block (do NOT output aws_iam_policy or KMS keys).\n"
+        "2. Replace Principal '*' with the EXACT IAM Role ARN from [VERIFIED GRAPH IDENTIFIERS] and enforce a StringEquals condition on 'aws:PrincipalArn'.\n"
+        "3. Explain how scoping the S3 Bucket Policy prevents unauthorized roles/workloads from reading the bucket.\n"
+        "4. State the quantified blast-radius reduction.",
+        'resource \\"aws_s3_bucket_policy\\" ...',
+    ),
+    "kms_resource_policy": (
+        "1. Synthesize ONLY an 'aws_kms_key' Terraform HCL block restricting the key policy Principal to the EXACT IAM Role ARN.\n"
+        "2. Enforce 'kms:EncryptionContext:aws:s3:arn' (when a bucket is present) or 'kms:ViaService'.\n"
+        "3. Explain how scoping the KMS Key Resource Policy mitigates direct decryption exposure.\n"
+        "4. State the quantified blast-radius reduction.",
+        'resource \\"aws_kms_key\\" ...',
+    ),
+    "iam_policy": (
+        "1. Synthesize ONLY an 'aws_iam_policy' Terraform HCL block replacing wildcard Resource '*' with the EXACT CMK ARN (or Terraform reference when .tf) and enforcing 'kms:EncryptionContext:aws:s3:arn' matching the target bucket.\n"
+        "2. Explain how this mitigates the multi-tier compromise chain.\n"
+        "3. State the quantified blast-radius reduction.",
+        'resource \\"aws_iam_policy\\" ...',
+    ),
+}
+
+
+def get_vector_remediation_guidance(vector_type: str) -> Tuple[str, str]:
+    """Returns (numbered_instructions, schema_example) tailored to the attack path's vector type."""
+    return _VECTOR_GUIDANCE.get(vector_type, _VECTOR_GUIDANCE["iam_policy"])
+
+
+def validate_and_repair_remediated_hcl(remediated_code: str, nodes: list) -> Tuple[str, bool]:
+    """
+    Verifies LLM-synthesized HCL matches the vector resource type, removes wildcards,
+    and preserves verified ARNs without hallucination. Falls back to build_scoped_kms_policy_hcl if invalid.
+    """
+    code = (remediated_code or "").strip()
+    if not code:
+        return build_scoped_kms_policy_hcl(nodes), True
+
+    refs = extract_verified_refs(nodes)
+    vector_type = refs["vector_type"]
+
+    expected_res = {
+        "s3_resource_policy": 'resource "aws_s3_bucket_policy"',
+        "kms_resource_policy": 'resource "aws_kms_key"',
+        "iam_policy": 'resource "aws_iam_policy"',
+    }.get(vector_type, 'resource "aws_iam_policy"')
+
+    if expected_res not in code:
+        return build_scoped_kms_policy_hcl(nodes), True
+
+    if vector_type == "s3_resource_policy":
+        if re.search(r'(?:Principal\s*=|"Principal"\s*:)\s*["\']\*["\']', code) or re.search(
+            r'AWS\s*[:=]\s*["\']\*["\']', code
+        ):
+            return build_scoped_kms_policy_hcl(nodes), True
+        if refs["use_explicit_arns"]:
+            if refs["role_arn"] and refs["role_arn"] not in code:
+                return build_scoped_kms_policy_hcl(nodes), True
+            if refs["bucket_name"] and refs["bucket_name"] not in code:
+                return build_scoped_kms_policy_hcl(nodes), True
+    elif vector_type == "kms_resource_policy":
+        if re.search(r'AWS\s*[:=]\s*["\']\*["\']', code):
+            return build_scoped_kms_policy_hcl(nodes), True
+        if refs["use_explicit_arns"]:
+            if refs["role_arn"] and refs["role_arn"] not in code:
+                return build_scoped_kms_policy_hcl(nodes), True
+            if refs["bucket_arn"] and refs["bucket_arn"] not in code:
+                return build_scoped_kms_policy_hcl(nodes), True
+    else:
+        if re.search(r'(?:Resource\s*=|"Resource"\s*:)\s*(?:\[\s*)?["\']\*["\']', code):
+            return build_scoped_kms_policy_hcl(nodes), True
+        if refs["use_explicit_arns"]:
+            if refs["key_arn"] and refs["key_arn"] not in code:
+                return build_scoped_kms_policy_hcl(nodes), True
+            if refs["bucket_arn"] and refs["bucket_arn"] not in code:
+                return build_scoped_kms_policy_hcl(nodes), True
+
+    return code, False
+
+
+def post_gemini_json(
+    api_endpoint: str,
+    api_key: str,
+    prompt: str,
+    timeout: int,
+    max_attempts: int = 3,
+    backoff_sec: float = 1.5,
+) -> Tuple[Optional[Dict[str, Any]], Optional[str]]:
+    """
+    Posts a deterministic (temperature=0.0) JSON generation request to Gemini with retry
+    on transient 429/503 responses. Returns (parsed_dict, error_message).
+    """
+    import requests
+
+    payload = {
+        "contents": [{"parts": [{"text": prompt}]}],
+        "generationConfig": {
+            "temperature": 0.0,
+            "responseMimeType": "application/json",
+        },
+    }
+    headers = {
+        "Content-Type": "application/json",
+        "X-goog-api-key": api_key,
+    }
+
+    last_err: Optional[str] = None
+    attempts = max(1, int(max_attempts))
+    for attempt in range(attempts):
+        resp = requests.post(api_endpoint, headers=headers, json=payload, timeout=timeout)
+        if resp.status_code == 200:
+            data = resp.json()
+            raw_text = data["candidates"][0]["content"]["parts"][0]["text"]
+            return parse_llm_json_response(raw_text), None
+        last_err = f"HTTP {resp.status_code}: {resp.text[:200]}"
+        if resp.status_code in (429, 503) and attempt + 1 < attempts:
+            time.sleep(backoff_sec * (attempt + 1))
+            continue
+        break
+    return None, last_err
+
+
 def generate_remediation_user_prompt(attack_path_dict: dict, vulnerable_code: str) -> str:
+    nodes = attack_path_dict.get("nodes") or []
+    refs = extract_verified_refs(nodes)
+    guidance, _ = get_vector_remediation_guidance(refs["vector_type"])
+
+    verified_lines = [
+        f"- Attack Vector Type: {refs['vector_type']}",
+        f"- Workload Name: {refs['workload_name']}",
+    ]
+    if refs["role_name"] or refs["role_arn"]:
+        verified_lines.append(f"- IAM Role Name: {refs['role_name']} | Exact Role ARN: {refs['role_arn']}")
+    if refs["policy_name"]:
+        verified_lines.append(f"- IAM Policy Name: {refs['policy_name']}")
+    if refs["key_name"] or refs["key_arn"]:
+        verified_lines.append(f"- KMS Key Name: {refs['key_name']} | Exact Key ARN: {refs['key_arn']}")
+    if refs["bucket_name"] or refs["bucket_arn"]:
+        verified_lines.append(f"- S3 Bucket Name: {refs['bucket_name']} | Exact Bucket ARN: {refs['bucket_arn']}")
+    if refs["allowed_actions"]:
+        verified_lines.append(f"- Preserved Non-Wildcard Actions: {json.dumps(refs['allowed_actions'])}")
+
     return f"""Analyze the following empirically proven cross-layer attack path and synthesize a least-privilege Terraform patch:
+
+[VERIFIED GRAPH IDENTIFIERS — USE VERBATIM, DO NOT INVENT OR TRUNCATE ARNS]
+{chr(10).join(verified_lines)}
 
 [ATTACK PATH CONTEXT]
 - Attack Path ID: {attack_path_dict.get('id')}
@@ -332,13 +525,11 @@ def generate_remediation_user_prompt(attack_path_dict: dict, vulnerable_code: st
 [ATTACK PATH HOPS]
 {chr(10).join(attack_path_dict.get('steps', []))}
 
-[VULNERABLE TERRAFORM CODE]
+[VULNERABLE TERRAFORM / POLICY CODE]
 ```hcl
 {vulnerable_code}
 ```
 
 Please synthesize:
-1. The exact remediated Terraform HCL block replacing the wildcard with the least-privilege CMK ARN and EncryptionContext condition.
-2. An explanation of how this remediation mitigates the multi-tier compromise chain.
-3. The quantified blast-radius reduction.
+{guidance}
 """

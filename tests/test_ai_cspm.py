@@ -2187,3 +2187,83 @@ def test_explicit_s3_principal_wildcard_enc_ctx_actions_and_consensus_vector():
     ]
     res_kms = consensus.run_consensus_evaluation({"id": "AP-002", "title": "KMS key policy", "nodes": kms_nodes})
     assert "KMS Key Resource Policy" in res_kms["red_team"]["attack_vector_en"]
+
+
+def test_gemini_prompt_grounding_retry_and_post_llm_guardrail():
+    from core.models import AttackPath
+    from ai.prompt_templates import (
+        generate_remediation_user_prompt,
+        validate_and_repair_remediated_hcl,
+        post_gemini_json,
+    )
+
+    s3_nodes = [
+        {"id": "w", "name": "payment-api", "type": "WORKLOAD", "source_file": "k8s.yaml"},
+        {"id": "sa", "name": "sa-pay", "type": "SERVICE_ACCOUNT", "source_file": "k8s.yaml"},
+        {"id": "r", "name": "eks-payment-processor-role", "type": "IAM_ROLE", "role_arn": "arn:aws:iam::123456789012:role/eks-irsa/eks-payment-processor-role", "source_file": "roles.json"},
+        {"id": "b", "name": "acme-public-assets-staging", "type": "S3_BUCKET", "bucket_name": "acme-public-assets-staging", "bucket_arn": "arn:aws:s3:::acme-public-assets-staging", "source_file": "buckets.json"},
+    ]
+    prompt = generate_remediation_user_prompt({"id": "AP-001", "nodes": s3_nodes, "steps": ["1. step"]}, "code")
+    assert "Attack Vector Type: s3_resource_policy" in prompt
+    assert "arn:aws:iam::123456789012:role/eks-irsa/eks-payment-processor-role" in prompt
+    assert "aws_s3_bucket_policy" in prompt
+
+    # Guardrail rejects hallucinated aws_iam_policy or truncated role ARN for s3_resource_policy
+    bad_hcl, repaired_wrong_type = validate_and_repair_remediated_hcl('resource "aws_iam_policy" "fake" {}', s3_nodes)
+    assert repaired_wrong_type is True
+    assert 'resource "aws_s3_bucket_policy"' in bad_hcl
+    assert "arn:aws:iam::123456789012:role/eks-irsa/eks-payment-processor-role" in bad_hcl
+
+    bad_role, repaired_trunc_arn = validate_and_repair_remediated_hcl(
+        'resource "aws_s3_bucket_policy" "p" { bucket = "acme-public-assets-staging", Principal = "arn:aws:iam::123456789012:role/eks-payment-processor-role" }',
+        s3_nodes,
+    )
+    assert repaired_trunc_arn is True
+    assert "arn:aws:iam::123456789012:role/eks-irsa/eks-payment-processor-role" in bad_role
+
+    valid_s3 = (
+        'resource "aws_s3_bucket_policy" "p" { bucket = "acme-public-assets-staging" '
+        'Principal = { AWS = "arn:aws:iam::123456789012:role/eks-irsa/eks-payment-processor-role" } }'
+    )
+    kept_hcl, repaired_valid = validate_and_repair_remediated_hcl(valid_s3, s3_nodes)
+    assert repaired_valid is False
+    assert kept_hcl == valid_s3
+
+    # Retry on HTTP 503 succeeds on 2nd attempt with temperature=0.0, and AIRemediationEngine applies guardrail
+    resp_503 = MagicMock(status_code=503, text="overloaded")
+    resp_200 = MagicMock(status_code=200)
+    resp_200.json.return_value = {
+        "candidates": [{
+            "content": {
+                "parts": [{
+                    "text": json.dumps({
+                        "remediated_code": 'resource "aws_iam_policy" "hallucinated_kms" { Resource = "arn:aws:kms:us-east-1:123456789012:key/12345678-fake" }',
+                        "explanation": "Grounded explanation from Gemini.",
+                        "least_privilege_changes": ["Scoped bucket policy"],
+                        "risk_reduction": "99.9%",
+                    })
+                }]
+            }
+        }]
+    }
+    with patch("time.sleep") as mock_sleep:
+        with patch("requests.post", side_effect=[resp_503, resp_200]) as mock_post:
+            with patch.dict(os.environ, {"GEMINI_API_KEY": "test-key"}):
+                engine = AIRemediationEngine(offline_mode=False)
+                ap = AttackPath(id="AP-001", title="T", nodes=s3_nodes, steps=["s1"], root_cause="rc", impact="imp")
+                rem = engine.synthesize_remediation(ap)
+                assert mock_post.call_count == 2
+                mock_sleep.assert_called_once()
+                sent_payload = mock_post.call_args_list[0].kwargs["json"]
+                assert sent_payload["generationConfig"]["temperature"] == 0.0
+                assert "Google Gemini Live" in engine.last_provider
+                assert rem.explanation == "Grounded explanation from Gemini."
+                assert 'resource "aws_s3_bucket_policy"' in rem.remediated_code
+                assert "arn:aws:iam::123456789012:role/eks-irsa/eks-payment-processor-role" in rem.remediated_code
+                assert any("Guardrail" in c for c in rem.least_privilege_changes)
+
+    # Direct post_gemini_json exhaustion returns clean HTTP 503 error
+    with patch("time.sleep"):
+        with patch("requests.post", return_value=resp_503):
+            parsed, err = post_gemini_json("https://example.invalid", "k", "p", 5, max_attempts=2, backoff_sec=0.1)
+            assert parsed is None and "HTTP 503" in err

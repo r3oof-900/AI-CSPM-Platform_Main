@@ -6,19 +6,20 @@ Supports live Google Gemini LLM API execution or built-in deterministic contextu
 
 import os
 import json
-import requests
 from typing import Optional
 try:
     from core.models import AttackPath, RemediationResult, NodeType
     from ai.prompt_templates import (
         SYSTEM_REMEDIATION_PROMPT,
         generate_remediation_user_prompt,
+        get_vector_remediation_guidance,
         load_env_secret,
         load_gemini_config,
-        parse_llm_json_response,
         extract_target_refs,
         detect_attack_path_vector,
         build_scoped_kms_policy_hcl,
+        validate_and_repair_remediated_hcl,
+        post_gemini_json,
         _sanitize_tf_ident,
     )
 except (ImportError, ValueError):
@@ -26,12 +27,14 @@ except (ImportError, ValueError):
     from .prompt_templates import (
         SYSTEM_REMEDIATION_PROMPT,
         generate_remediation_user_prompt,
+        get_vector_remediation_guidance,
         load_env_secret,
         load_gemini_config,
-        parse_llm_json_response,
         extract_target_refs,
         detect_attack_path_vector,
         build_scoped_kms_policy_hcl,
+        validate_and_repair_remediated_hcl,
+        post_gemini_json,
         _sanitize_tf_ident,
     )
 
@@ -79,28 +82,33 @@ class AIRemediationEngine:
             try:
                 with open(source_file, "r", encoding="utf-8") as f:
                     content = f.read()
-                expected_kw = (
-                    "aws_s3_bucket_policy"
-                    if vector_type == "s3_resource_policy"
-                    else ("aws_kms_key" if vector_type == "kms_resource_policy" else None)
-                )
-                if expected_kw and expected_kw not in content:
-                    src_dir = os.path.dirname(source_file)
-                    for fname in sorted(os.listdir(src_dir)):
-                        if fname.endswith(".tf") and not fname.endswith(".backup") and not fname.startswith("remediated_"):
-                            cand = os.path.join(src_dir, fname)
-                            try:
-                                with open(cand, "r", encoding="utf-8") as cf:
-                                    c_txt = cf.read()
-                                if expected_kw in c_txt:
-                                    return c_txt
-                            except Exception:
-                                pass
-                return content
+                if source_file.endswith(".json"):
+                    parsed_sf = json.loads(content)
+                    if isinstance(parsed_sf, dict) and "Statement" in parsed_sf:
+                        return content
+                else:
+                    expected_kw = (
+                        "aws_s3_bucket_policy"
+                        if vector_type == "s3_resource_policy"
+                        else ("aws_kms_key" if vector_type == "kms_resource_policy" else None)
+                    )
+                    if expected_kw and expected_kw not in content:
+                        src_dir = os.path.dirname(source_file)
+                        for fname in sorted(os.listdir(src_dir)):
+                            if fname.endswith(".tf") and not fname.endswith(".backup") and not fname.startswith("remediated_"):
+                                cand = os.path.join(src_dir, fname)
+                                try:
+                                    with open(cand, "r", encoding="utf-8") as cf:
+                                        c_txt = cf.read()
+                                    if expected_kw in c_txt:
+                                        return c_txt
+                                except Exception:
+                                    pass
+                    return content
             except Exception:
                 pass
 
-        if fallback_source:
+        if fallback_source and fallback_source.endswith(".tf"):
             try:
                 with open(fallback_source, "r", encoding="utf-8") as f:
                     return f.read()
@@ -247,7 +255,9 @@ class AIRemediationEngine:
         )
 
     def _call_live_gemini(self, attack_path: AttackPath, original_code: str) -> Optional[RemediationResult]:
-        """Invokes external Google Gemini LLM API to synthesize least-privilege Terraform."""
+        """Invokes external Google Gemini LLM API to synthesize least-privilege Terraform with post-LLM guardrails."""
+        vector_type = detect_attack_path_vector(attack_path.nodes)
+        _, schema_example = get_vector_remediation_guidance(vector_type)
         prompt = f"""
 {SYSTEM_REMEDIATION_PROMPT}
 
@@ -255,35 +265,35 @@ class AIRemediationEngine:
 
 Return ONLY valid JSON matching this schema:
 {{
-  "remediated_code": "resource \\"aws_iam_policy\\" ...",
+  "remediated_code": "{schema_example}",
   "explanation": "Detailed explanation of remediation",
   "least_privilege_changes": ["change 1", "change 2"],
   "risk_reduction": "Blast radius reduced by 99.9%"
 }}
 """
-        payload = {
-            "contents": [{"parts": [{"text": prompt}]}],
-            "generationConfig": {
-                "temperature": 0.2,
-                "responseMimeType": "application/json"
-            }
-        }
-        headers = {
-            "Content-Type": "application/json",
-            "X-goog-api-key": self.gemini_key
-        }
-        resp = requests.post(self.api_endpoint, headers=headers, json=payload, timeout=self.timeout)
-        if resp.status_code == 200:
-            data = resp.json()
-            raw_text = data["candidates"][0]["content"]["parts"][0]["text"]
-            parsed = parse_llm_json_response(raw_text)
-            return RemediationResult(
-                attack_path_id=attack_path.id,
-                original_code=original_code,
-                remediated_code=parsed.get("remediated_code", ""),
-                explanation=parsed.get("explanation", ""),
-                least_privilege_changes=parsed.get("least_privilege_changes", []),
-                risk_reduction=parsed.get("risk_reduction", "99.9% containment")
-            )
-        self.last_error = f"HTTP {resp.status_code}: {resp.text[:200]}"
-        return None
+        parsed, err = post_gemini_json(self.api_endpoint, self.gemini_key, prompt, self.timeout)
+        if parsed is None:
+            self.last_error = err
+            return None
+
+        raw_code = str(parsed.get("remediated_code", "") or "")
+        if not raw_code.strip():
+            self.last_error = "Gemini returned empty remediated_code; fell back to deterministic synthesis"
+            return None
+
+        remediated_hcl, was_repaired = validate_and_repair_remediated_hcl(
+            raw_code,
+            attack_path.nodes,
+        )
+        changes = list(parsed.get("least_privilege_changes", []) or [])
+        if was_repaired:
+            changes.append("Post-LLM Guardrail: Verified and locked HCL to exact graph ARNs and vector resource type.")
+
+        return RemediationResult(
+            attack_path_id=attack_path.id,
+            original_code=original_code,
+            remediated_code=remediated_hcl,
+            explanation=parsed.get("explanation", ""),
+            least_privilege_changes=changes,
+            risk_reduction=parsed.get("risk_reduction", "99.9% containment"),
+        )

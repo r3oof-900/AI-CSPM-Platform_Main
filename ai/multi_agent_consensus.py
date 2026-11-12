@@ -14,17 +14,19 @@ try:
     from ai.prompt_templates import (
         load_env_secret,
         load_gemini_config,
-        parse_llm_json_response,
         detect_attack_path_vector,
+        extract_verified_refs,
         build_scoped_kms_policy_hcl,
+        post_gemini_json,
     )
 except (ImportError, ValueError):
     from .prompt_templates import (
         load_env_secret,
         load_gemini_config,
-        parse_llm_json_response,
         detect_attack_path_vector,
+        extract_verified_refs,
         build_scoped_kms_policy_hcl,
+        post_gemini_json,
     )
 
 
@@ -78,13 +80,12 @@ class MultiAgentConsensusEngine:
         return res
 
     def _call_gemini_consensus(self, path_data: Dict[str, Any]) -> Optional[Dict[str, Any]]:
-        """Invokes Google Gemini API with structured prompt for multi-agent deliberation."""
-        import requests
-
+        """Invokes Google Gemini API with grounded ARNs, vector context, and retry handling."""
         nodes = path_data.get("nodes", [])
+        refs = extract_verified_refs(nodes)
         workload = path_data.get("source_node") or (nodes[0].get("name") if nodes else "Kubernetes pod")
         dest = path_data.get("destination") or (nodes[-1].get("name") if nodes else "Storage Vault & tenant KMS keys")
-        pivot = path_data.get("pivot_node") or (nodes[2].get("name") if len(nodes) > 2 else "AWS IAM Role via OIDC IRSA")
+        pivot = path_data.get("pivot_node") or refs.get("role_name") or (nodes[2].get("name") if len(nodes) > 2 else "AWS IAM Role via OIDC IRSA")
         steps_text = "\n".join(path_data.get("steps", [])) or "Workload -> ServiceAccount -> IAM Role -> IAM Policy -> KMS -> Storage"
         root_cause = path_data.get("root_cause", "Overprivileged wildcard policy granting kms:Decrypt on Resource '*'")
         all_paths = path_data.get("all_attack_paths") or []
@@ -96,20 +97,23 @@ class MultiAgentConsensusEngine:
 
         prompt = f"""
 You are the AI-CSPM Multi-Agent Cloud Security Consensus Engine.
-Analyze the following cross-layer cloud security vulnerability:
+Analyze the following cross-layer cloud security vulnerability (copy any ARNs VERBATIM, never invent or alter them):
 - Attack Path ID: {path_data.get('id', 'AP-001')}
+- Attack Vector Type: {refs['vector_type']}
 - Title: {path_data.get('title', 'Cross-Layer Attack Path')}
 - Total Attack Paths Discovered: {max(1, len(all_paths))}
 - Workload: {workload}
-- Identity Pivot: {pivot}
+- Identity Pivot: {pivot} | Exact Role ARN: {refs.get('role_arn') or 'N/A'}
+- KMS Key ARN: {refs.get('key_arn') or 'N/A'}
+- S3 Bucket ARN: {refs.get('bucket_arn') or 'N/A'}
 - Root Cause: {root_cause}
 - Impacted Assets: {dest}
 - Path Hops:
 {steps_text}{extra_paths_note}
 
 Act as three distinct agents deliberating together:
-1. Agent 1 (Red-Team Offense): Detail attack exploitation vector, lateral movement, blast radius.
-2. Agent 2 (Blue-Team Defense): Detail scoped least-privilege remediation strategy and key Terraform changes.
+1. Agent 1 (Red-Team Offense): Detail attack exploitation vector (matching Attack Vector Type '{refs['vector_type']}'), lateral movement, blast radius.
+2. Agent 2 (Blue-Team Defense): Detail scoped least-privilege remediation strategy and exact Terraform resource changes for '{refs['vector_type']}'.
 3. Agent 3 (Compliance Arbiter): Assess CVSS 4.0 severity score and declare final consensus verdict.
 
 Return ONLY a valid JSON object matching this schema:
@@ -120,7 +124,7 @@ Return ONLY a valid JSON object matching this schema:
     "status": "VULNERABILITY CONFIRMED",
     "attack_vector_en": "string",
     "attack_vector_ar": "string",
-    "blast_radius": "100% of tenant KMS keys & databases",
+    "blast_radius": "string",
     "lateral_movement_steps": ["step 1", "step 2", "step 3"]
   }},
   "blue_team": {{
@@ -146,32 +150,17 @@ Return ONLY a valid JSON object matching this schema:
   "consensus_status": "APPROVED (3/3 AGENTS AGREED)"
 }}
 """
-        payload = {
-            "contents": [{"parts": [{"text": prompt}]}],
-            "generationConfig": {
-                "temperature": 0.2,
-                "responseMimeType": "application/json"
-            }
-        }
-
-        headers = {
-            "Content-Type": "application/json",
-            "X-goog-api-key": self.gemini_key
-        }
-        resp = requests.post(self.api_endpoint, headers=headers, json=payload, timeout=self.timeout)
-        if resp.status_code == 200:
-            data = resp.json()
-            raw_text = data["candidates"][0]["content"]["parts"][0]["text"]
-            parsed = parse_llm_json_response(raw_text)
-            if not isinstance(parsed, dict) or not all(k in parsed for k in ("red_team", "blue_team", "arbiter")):
-                self.last_error = "Gemini consensus JSON missing required agent sections"
-                return None
-            parsed["is_live_llm"] = True
-            parsed["engine_provider"] = f"Google Gemini Live ({self.model_name})"
-            parsed.setdefault("scoped_terraform_patch", self._get_canonical_hcl_patch(path_data))
-            return parsed
-        self.last_error = f"HTTP {resp.status_code}: {resp.text[:200]}"
-        return None
+        parsed, err = post_gemini_json(self.api_endpoint, self.gemini_key, prompt, self.timeout)
+        if parsed is None:
+            self.last_error = err
+            return None
+        if not isinstance(parsed, dict) or not all(k in parsed for k in ("red_team", "blue_team", "arbiter")):
+            self.last_error = "Gemini consensus JSON missing required agent sections"
+            return None
+        parsed["is_live_llm"] = True
+        parsed["engine_provider"] = f"Google Gemini Live ({self.model_name})"
+        parsed.setdefault("scoped_terraform_patch", self._get_canonical_hcl_patch(path_data))
+        return parsed
 
     def _get_canonical_hcl_patch(self, path_data: Dict[str, Any]) -> str:
         """Dynamic Scoped Least-Privilege Terraform HCL."""
