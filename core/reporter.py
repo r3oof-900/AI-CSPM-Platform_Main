@@ -450,16 +450,22 @@ def apply_auto_remediation(
     if resolved_s3 and bucket_name not in tf_s3_names:
         bucket_name = resolved_s3
 
-    # Standalone JSON IAM policy file
+    # Standalone JSON IAM policy file (skip exported AWS snapshot bundles without top-level Statement)
     if source_file and os.path.exists(source_file) and source_file.endswith(".json"):
-        backup_path = source_file + ".backup"
-        if not os.path.exists(backup_path):
-            shutil.copy2(source_file, backup_path)
-        return _patch_standalone_json_policy(
-            source_file,
-            key_arn=key_arn or f"arn:aws:kms:us-east-1:123456789012:key/{key_name}",
-            bucket_arn=bucket_arn or f"arn:aws:s3:::{bucket_name}",
-        )
+        try:
+            with open(source_file, "r", encoding="utf-8") as jf:
+                jdata = json.load(jf)
+        except Exception:
+            jdata = None
+        if isinstance(jdata, dict) and "Statement" in jdata:
+            backup_path = source_file + ".backup"
+            if not os.path.exists(backup_path):
+                shutil.copy2(source_file, backup_path)
+            return _patch_standalone_json_policy(
+                source_file,
+                key_arn=key_arn or f"arn:aws:kms:us-east-1:123456789012:key/{key_name}",
+                bucket_arn=bucket_arn or f"arn:aws:s3:::{bucket_name}",
+            )
 
     # 2. Determine target .tf file and resource type
     target_res_type = "aws_iam_policy" if has_iam_policy else ("aws_kms_key" if has_kms_key else "aws_s3_bucket_policy")

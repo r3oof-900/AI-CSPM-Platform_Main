@@ -35,6 +35,7 @@ try:
         KMSKeyNode,
         S3BucketNode,
         PolicyStatement,
+        parse_policy_statements,
         statement_allows_kms_decrypt,
         statement_has_wildcard_kms_resource,
     )
@@ -48,6 +49,7 @@ except (ImportError, ValueError):
         KMSKeyNode,
         S3BucketNode,
         PolicyStatement,
+        parse_policy_statements,
         statement_allows_kms_decrypt,
         statement_has_wildcard_kms_resource,
     )
@@ -636,40 +638,7 @@ class LiveCloudFetcher:
 
     def _parse_policy_statements(self, doc: Dict[str, Any]) -> List[PolicyStatement]:
         """Converts raw IAM policy JSON statements into PolicyStatement model."""
-        statements = []
-        raw_stmts = doc.get("Statement", [])
-        if isinstance(raw_stmts, dict):
-            raw_stmts = [raw_stmts]
-
-        for stmt in raw_stmts:
-            if not isinstance(stmt, dict):
-                continue
-            effect = stmt.get("Effect", "Allow")
-            actions = stmt.get("Action", [])
-            if isinstance(actions, str):
-                actions = [actions]
-            not_actions = stmt.get("NotAction", [])
-            if isinstance(not_actions, str):
-                not_actions = [not_actions]
-            resources = stmt.get("Resource", [])
-            if isinstance(resources, str):
-                resources = [resources]
-            not_resources = stmt.get("NotResource", [])
-            if isinstance(not_resources, str):
-                not_resources = [not_resources]
-            conditions = stmt.get("Condition", {})
-
-            statements.append(PolicyStatement(
-                sid=stmt.get("Sid"),
-                effect=effect,
-                principal=stmt.get("Principal"),
-                actions=actions,
-                not_actions=not_actions,
-                resources=resources,
-                not_resources=not_resources,
-                conditions=conditions
-            ))
-        return statements
+        return parse_policy_statements(doc)
 
     # =========================================================================
     # Live Kubernetes Ingestion Engine

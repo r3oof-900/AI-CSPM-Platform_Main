@@ -17,6 +17,7 @@ try:
         S3BucketNode,
         PolicyStatement,
         NodeType,
+        parse_policy_statements,
         statement_allows_kms_decrypt,
         statement_has_wildcard_kms_resource,
     )
@@ -28,6 +29,7 @@ except (ImportError, ValueError):
         S3BucketNode,
         PolicyStatement,
         NodeType,
+        parse_policy_statements,
         statement_allows_kms_decrypt,
         statement_has_wildcard_kms_resource,
     )
@@ -372,6 +374,9 @@ class TerraformParser:
             with open(filepath, "r", encoding="utf-8") as f:
                 data = json.load(f)
 
+            if not isinstance(data, dict) or "Statement" not in data:
+                return
+
             statements = self._parse_statements(data.get("Statement", []))
             has_wildcard = any(
                 statement_allows_kms_decrypt(s) and statement_has_wildcard_kms_resource(s)
@@ -394,41 +399,7 @@ class TerraformParser:
 
     def _parse_statements(self, stmts_data: Any) -> List[PolicyStatement]:
         """Normalizes IAM policy statements."""
-        if isinstance(stmts_data, dict):
-            stmts_data = [stmts_data]
-        elif not isinstance(stmts_data, list):
-            return []
-
-        parsed = []
-        for s in stmts_data:
-            if not isinstance(s, dict):
-                continue
-
-            actions = s.get("Action", [])
-            if isinstance(actions, str):
-                actions = [actions]
-            not_actions = s.get("NotAction", [])
-            if isinstance(not_actions, str):
-                not_actions = [not_actions]
-
-            resources = s.get("Resource", [])
-            if isinstance(resources, str):
-                resources = [resources]
-            not_resources = s.get("NotResource", [])
-            if isinstance(not_resources, str):
-                not_resources = [not_resources]
-
-            parsed.append(PolicyStatement(
-                sid=s.get("Sid"),
-                effect=s.get("Effect", "Allow"),
-                principal=s.get("Principal"),
-                actions=actions,
-                not_actions=not_actions,
-                resources=resources,
-                not_resources=not_resources,
-                conditions=s.get("Condition", {})
-            ))
-        return parsed
+        return parse_policy_statements(stmts_data)
 
     def parse_tf_file(self, filepath: str):
         """Parses a Terraform .tf file."""

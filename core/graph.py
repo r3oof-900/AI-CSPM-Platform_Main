@@ -478,7 +478,7 @@ class ContextualGraph:
                     if match_kind == "wildcard" and not _resource_policy_allows_role_account(stmt, r):
                         continue
                     wildcard_unrestricted = (match_kind == "wildcard" and not has_identity_restriction)
-                    if (wildcard_unrestricted or not has_conditions) and not self.graph.has_edge(r.id, b.id):
+                    if wildcard_unrestricted and not self.graph.has_edge(r.id, b.id):
                         self.add_edge(
                             r.id,
                             b.id,

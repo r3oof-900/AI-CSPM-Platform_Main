@@ -15,6 +15,7 @@ try:
         load_env_secret,
         load_gemini_config,
         parse_llm_json_response,
+        detect_attack_path_vector,
         build_scoped_kms_policy_hcl,
     )
 except (ImportError, ValueError):
@@ -22,6 +23,7 @@ except (ImportError, ValueError):
         load_env_secret,
         load_gemini_config,
         parse_llm_json_response,
+        detect_attack_path_vector,
         build_scoped_kms_policy_hcl,
     )
 
@@ -344,6 +346,92 @@ Return ONLY a valid JSON object matching this schema:
         if not role:
             role = "Cloud IAM Role (via OIDC IRSA)"
 
+        vector_type = detect_attack_path_vector(nodes)
+        if vector_type == "s3_resource_policy":
+            blast_radius_txt = f"Direct S3 Vault Exposure ({dest})"
+            red_ar = (
+                f"قام وكيل الفريق الأحمر باختراق حاوية العمل `{workload}` داخل كوبرنيتس، ثم انتحل دور `{role}` عبر IRSA. "
+                f"نظراً لوجود سياسة S3 مفتوحة بدون تقييد هوية كافٍ (`Principal: '*'`)، تمكن المهاجم من قراءة بيانات `{dest}` مباشرة!"
+            )
+            red_en = (
+                f"Red-Team compromised Kubernetes container '{workload}' and assumed AWS IAM Role '{role}' via OIDC IRSA federation. "
+                f"Because an S3 Bucket Policy permits unconditional access (Principal '*'), the attacker accessed records in '{dest}' directly."
+            )
+            step4_en = "Step 4: Exploit overly permissive S3 Bucket Policy (Principal '*') without aws:PrincipalArn constraint."
+            blue_ar = (
+                "قام وكيل الفريق الأزرق بصياغة كود تيرافورم تصحيحي (HCL Patch) لسياسة حاوية S3:\n"
+                "1. إزالة الوصول الشامل `Principal: '*'` واستبداله بـ ARN الدور المصرح به فقط (أو حذف عبارة السماح غير الضرورية).\n"
+                "2. فرض شرط الهوية `aws:PrincipalArn` لتقييد الوصول تماماً."
+            )
+            blue_en = (
+                "Blue-Team synthesized a scoped Terraform S3 Bucket Policy remediation:\n"
+                "1. Removed wildcard Principal ('*') in favor of explicit authorized IAM Role ARN (or statement removal if unneeded).\n"
+                "2. Enforced strict aws:PrincipalArn condition constraints."
+            )
+            controls = [
+                "Wildcard Principal Eliminated: Replaced Principal '*' on target S3 Bucket Policy.",
+                "Explicit Identity Condition: Enforced aws:PrincipalArn matching authorized role.",
+                "Cross-Principal Isolation: Unauthorized roles can no longer read the S3 vault.",
+            ]
+        elif vector_type == "kms_resource_policy":
+            blast_radius_txt = f"Direct KMS Key Resource Policy Exposure ({dest})"
+            red_ar = (
+                f"قام وكيل الفريق الأحمر باختراق حاوية العمل `{workload}` وانتحل دور `{role}` عبر IRSA. "
+                f"بسبب سياسة مفتاح KMS المباشرة غير المقيدة بشرط سياقي، تمكن المهاجم من فك تشفير بيانات `{dest}`!"
+            )
+            red_en = (
+                f"Red-Team compromised Kubernetes container '{workload}' and assumed AWS IAM Role '{role}' via OIDC IRSA federation. "
+                f"Because the KMS Key Resource Policy lacks EncryptionContext/ViaService constraints, the attacker decrypted '{dest}'."
+            )
+            step4_en = "Step 4: Exploit unconstrained KMS Key Resource Policy lacking kms:EncryptionContext."
+            blue_ar = (
+                "قام وكيل الفريق الأزرق بصياغة كود تيرافورم تصحيحي لسياسة مفتاح KMS:\n"
+                "1. تقييد الـ Principal بدور IAM الصريح المصرح له.\n"
+                "2. فرض شرط `kms:EncryptionContext` أو `kms:ViaService` لمنع استخدام المفتاح خارج السياق المعتمد."
+            )
+            blue_en = (
+                "Blue-Team synthesized a scoped Terraform KMS Key Policy remediation:\n"
+                "1. Restricted Key Policy Principal strictly to the authorized IAM Role ARN.\n"
+                "2. Enforced kms:EncryptionContext / kms:ViaService cryptographic conditions."
+            )
+            controls = [
+                "Explicit Key Principal: Constrained KMS Key Policy to authorized IAM Role.",
+                "Cryptographic Binding: Enforced kms:EncryptionContext / kms:ViaService.",
+                "Least-Privilege Key Usage: Blocked arbitrary cross-bucket decryption.",
+            ]
+        else:
+            blast_radius_txt = "100% of AWS Tenant Cryptographic Keys (Cross-Tenant Exposure)"
+            red_ar = (
+                f"قام وكيل الفريق الأحمر باختراق حاوية العمل `{workload}` داخل كوبرنيتس. "
+                "من خلال رمز ServiceAccount المميز، انتحل المهاجم دور AWS IAM "
+                f"`{role}` عبر اتحاد OIDC IRSA. "
+                "نظراً لوجود سياسة تمنح `kms:Decrypt` مع `Resource: '*'`: "
+                f"تمكن المهاجم من فك تشفير أي مفتاح تشفير في الحساب وسرقة بيانات `{dest}`!"
+            )
+            red_en = (
+                f"Red-Team compromised Kubernetes container '{workload}'. "
+                f"Using the projected ServiceAccount token, the agent assumed AWS IAM Role '{role}' via OIDC IRSA federation. "
+                "Because attached IAM policy allows kms:Decrypt on wildcard '*', the attacker successfully bypassed "
+                f"cryptographic boundaries to decrypt KMS keys and exfiltrate records from '{dest}'."
+            )
+            step4_en = "Step 4: Exploit wildcard Resource '*' to decrypt customer databases across the tenant."
+            blue_ar = (
+                "قام وكيل الفريق الأزرق بتحليل مسار الهجوم وصياغة كود تيرافورم تصحيحي (HCL Patch) يطبق مبدأ أقل الصلاحيات بصرامة:\n"
+                "1. استبدال المورد الشامل '*' برمز المورد الدقيق (ARN) لمفتاح التشفير المعتمد فقط.\n"
+                "2. إضافة شرط سياقي تشفيري صارم `kms:EncryptionContext:aws:s3:arn` يقيد فك التشفير بالطلبات الصادرة حصرياً من الخزانة المعتمدة."
+            )
+            blue_en = (
+                "Blue-Team synthesized a scoped Terraform HCL remediation strictly enforcing Least Privilege:\n"
+                "1. Replaced unconstrained wildcard Resource ('*') with exact Customer Managed Key ARN.\n"
+                "2. Enforced cryptographic EncryptionContext condition tying kms:Decrypt strictly to requests originating from authorized storage."
+            )
+            controls = [
+                "Strict Resource Scoping: Limited exclusively to authorized CMK ARN.",
+                "Cryptographic Binding: kms:EncryptionContext condition prevents unauthorized reuse across buckets.",
+                "Attack Path Neutralization: Pod can no longer touch other tenant KMS keys or databases.",
+                "Zero Downtime: Compliant with existing application workloads and AWS IAM best practices."
+            ]
+
         return {
             "is_live_llm": False,
             "engine_provider": "AI-CSPM Contextual Multi-Agent Core (Zero-Failure Fallback)",
@@ -354,25 +442,14 @@ Return ONLY a valid JSON object matching this schema:
                 "agent_name": "Agent 1: Red-Team Offense (محاكي الاختراق والهجوم)",
                 "role": "Adversarial Threat Simulation & Exploitation Analysis",
                 "status": "CRITICAL EXPLOIT CONFIRMED",
-                "blast_radius": "100% of AWS Tenant Cryptographic Keys (Cross-Tenant Exposure)",
-                "attack_vector_ar": (
-                    f"قام وكيل الفريق الأحمر باختراق حاوية العمل `{workload}` داخل كوبرنيتس. "
-                    "من خلال رمز ServiceAccount المميز، انتحل المهاجم دور AWS IAM "
-                    f"`{role}` عبر اتحاد OIDC IRSA. "
-                    "نظراً لوجود سياسة تمنح `kms:Decrypt` مع `Resource: '*'`: "
-                    f"تمكن المهاجم من فك تشفير أي مفتاح تشفير في الحساب وسرقة بيانات `{dest}`!"
-                ),
-                "attack_vector_en": (
-                    f"Red-Team compromised Kubernetes container '{workload}'. "
-                    f"Using the projected ServiceAccount token, the agent assumed AWS IAM Role '{role}' via OIDC IRSA federation. "
-                    "Because attached IAM policy allows kms:Decrypt on wildcard '*', the attacker successfully bypassed "
-                    f"cryptographic boundaries to decrypt KMS keys and exfiltrate records from '{dest}'."
-                ),
+                "blast_radius": blast_radius_txt,
+                "attack_vector_ar": red_ar,
+                "attack_vector_en": red_en,
                 "lateral_movement_steps": [
                     f"Step 1: Compromise Pod container '{workload}' via application vulnerability.",
                     "Step 2: Read projected OIDC ServiceAccount token bound to IRSA.",
                     f"Step 3: Call sts:AssumeRoleWithWebIdentity to obtain temporary AWS credentials for '{role}'.",
-                    "Step 4: Exploit wildcard Resource '*' to decrypt customer databases across the tenant.",
+                    step4_en,
                     "Step 5: Full data exfiltration without triggering single-layer IAM alarms (Prowler PASS)."
                 ]
             },
@@ -380,22 +457,9 @@ Return ONLY a valid JSON object matching this schema:
                 "agent_name": "Agent 2: Blue-Team Defense (مهندس المعالجة والدفاع)",
                 "role": "DevSecOps Least-Privilege Policy Synthesis & IaC Hardening",
                 "status": "LEAST-PRIVILEGE PATCH SYNTHESIZED",
-                "defense_strategy_ar": (
-                    "قام وكيل الفريق الأزرق بتحليل مسار الهجوم وصياغة كود تيرافورم تصحيحي (HCL Patch) يطبق مبدأ أقل الصلاحيات بصرامة:\n"
-                    "1. استبدال المورد الشامل '*' برمز المورد الدقيق (ARN) لمفتاح التشفير المعتمد فقط.\n"
-                    "2. إضافة شرط سياقي تشفيري صارم `kms:EncryptionContext:aws:s3:arn` يقيد فك التشفير بالطلبات الصادرة حصرياً من الخزانة المعتمدة."
-                ),
-                "defense_strategy_en": (
-                    "Blue-Team synthesized a scoped Terraform HCL remediation strictly enforcing Least Privilege:\n"
-                    "1. Replaced unconstrained wildcard Resource ('*') with exact Customer Managed Key ARN.\n"
-                    "2. Enforced cryptographic EncryptionContext condition tying kms:Decrypt strictly to requests originating from authorized storage."
-                ),
-                "least_privilege_controls": [
-                    "Strict Resource Scoping: Limited exclusively to authorized CMK ARN.",
-                    "Cryptographic Binding: kms:EncryptionContext condition prevents unauthorized reuse across buckets.",
-                    "Attack Path Neutralization: Pod can no longer touch other tenant KMS keys or databases.",
-                    "Zero Downtime: Compliant with existing application workloads and AWS IAM best practices."
-                ]
+                "defense_strategy_ar": blue_ar,
+                "defense_strategy_en": blue_en,
+                "least_privilege_controls": controls,
             },
             "arbiter": {
                 "agent_name": "Agent 3: Compliance & Risk Arbiter (قاضي التحكيم والامتثال)",

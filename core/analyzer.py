@@ -127,6 +127,10 @@ class AttackPathAnalyzer:
                         elif ntype == NodeType.S3_BUCKET.value and node_obj is not None:
                             node_entry["bucket_arn"] = getattr(node_obj, "bucket_arn", None)
                             node_entry["bucket_name"] = getattr(node_obj, "bucket_name", None)
+                            if via_resource_policy and flawed_actions:
+                                scoped_s3_acts = [a for a in flawed_actions if str(a).strip() not in ("*", "s3:*")]
+                                if scoped_s3_acts:
+                                    node_entry["allowed_actions"] = scoped_s3_acts
                         elif ntype == NodeType.IAM_POLICY.value and node_obj is not None:
                             node_entry["policy_arn"] = getattr(node_obj, "policy_arn", None)
                         elif ntype == NodeType.IAM_ROLE.value and node_obj is not None:
@@ -418,11 +422,13 @@ class AttackPathAnalyzer:
                 bucket_name = d.get("name", n)
                 props = d.get("properties", {})
                 res_id = props.get("res_id", bucket_name)
+                src_file = str(d.get("source_file") or "")
+                from_tf = self.tf is not None and not src_file.lower().endswith(".json") and not src_file.startswith(("aws://", "k8s://", "kubectl://"))
 
-                # Check public access block (node property from live fetcher OR Terraform parser)
+                # Check public access block (node property from live/snapshot parser OR Terraform parser)
                 if "has_public_access_block" in props and props["has_public_access_block"] is not None:
                     has_pab: Optional[bool] = bool(props["has_public_access_block"])
-                elif self.tf is not None:
+                elif from_tf:
                     pab_entry = self.tf.s3_public_access_blocks.get(bucket_name) or self.tf.s3_public_access_blocks.get(res_id)
                     has_pab = bool(pab_entry.get("_all_blocked", False)) if pab_entry else False
                 else:
@@ -452,7 +458,7 @@ class AttackPathAnalyzer:
                 # Check access logging
                 if "has_logging" in props and props["has_logging"] is not None:
                     has_logging: Optional[bool] = bool(props["has_logging"])
-                elif self.tf is not None:
+                elif from_tf:
                     has_logging = bucket_name in self.tf.s3_logging_configs or res_id in self.tf.s3_logging_configs
                 else:
                     has_logging = None
@@ -478,7 +484,7 @@ class AttackPathAnalyzer:
                 # Check lifecycle rules
                 if "has_lifecycle" in props and props["has_lifecycle"] is not None:
                     has_lifecycle: Optional[bool] = bool(props["has_lifecycle"])
-                elif self.tf is not None:
+                elif from_tf:
                     has_lifecycle = bucket_name in self.tf.s3_lifecycle_configs or res_id in self.tf.s3_lifecycle_configs
                 else:
                     has_lifecycle = None

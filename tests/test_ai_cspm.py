@@ -1975,3 +1975,215 @@ def test_live_json_stdout_clean_and_gemini_timeout_fallback(tmp_path, monkeypatc
     assert "Authenticated to AWS" not in captured.out
     parsed = json.loads(captured.out)
     assert parsed["metrics"]["total_assets"] == 1
+
+
+def test_aws_json_snapshot_ingestion_and_cross_layer_scan(tmp_path, capsys):
+    import urllib.parse
+    import ai_cspm
+    from ingestion.aws_json_parser import AwsJsonParser
+
+    k8s_dir = tmp_path / "k8s"
+    aws_dir = tmp_path / "aws"
+    k8s_dir.mkdir()
+    aws_dir.mkdir()
+
+    (k8s_dir / "workloads.yaml").write_text(
+        """apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: sa-etl
+  namespace: data
+  annotations:
+    eks.amazonaws.com/role-arn: arn:aws:iam::123456789012:role/eks/etl-role
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: etl-worker
+  namespace: data
+spec:
+  template:
+    spec:
+      serviceAccountName: sa-etl
+      containers:
+        - name: etl
+          image: python:3.12
+""",
+        encoding="utf-8",
+    )
+
+    # Write trust/encryption/policies BEFORE roles/keys/buckets to also verify order independence
+    trust_doc = {
+        "Version": "2012-10-17",
+        "Statement": [{
+            "Effect": "Allow",
+            "Principal": {"Federated": "arn:aws:iam::123456789012:oidc-provider/oidc.eks.us-east-1.amazonaws.com/id/OIDC123"},
+            "Action": "sts:AssumeRoleWithWebIdentity",
+            "Condition": {"StringEquals": {"oidc.eks.us-east-1.amazonaws.com/id/OIDC123:aud": "sts.amazonaws.com"}},
+        }],
+    }
+    (aws_dir / "01_trust-policies.json").write_text(json.dumps({
+        "TrustPolicies": [{
+            "RoleName": "etl-role",
+            "RoleArn": "arn:aws:iam::123456789012:role/eks/etl-role",
+            "AssumeRolePolicyDocument": urllib.parse.quote(json.dumps(trust_doc)),
+        }]
+    }), encoding="utf-8")
+
+    (aws_dir / "02_encryption.json").write_text(json.dumps({
+        "BucketEncryptions": [{
+            "Bucket": "pii-vault",
+            "ServerSideEncryptionConfiguration": {
+                "Rules": [{"ApplyServerSideEncryptionByDefault": {"SSEAlgorithm": "aws:kms", "KMSMasterKeyID": "key-uuid-1"}}]
+            },
+        }]
+    }), encoding="utf-8")
+
+    (aws_dir / "03_key-policies.json").write_text(json.dumps({
+        "KeyPolicies": [{
+            "KeyId": "key-uuid-1",
+            "Policy": json.dumps({
+                "Version": "2012-10-17",
+                "Statement": [{"Effect": "Allow", "Principal": {"AWS": "arn:aws:iam::123456789012:root"}, "Action": "kms:*", "Resource": "*"}],
+            }),
+        }]
+    }), encoding="utf-8")
+
+    (aws_dir / "04_policies.json").write_text(json.dumps({
+        "Policies": [{
+            "PolicyName": "BroadKmsPol",
+            "Arn": "arn:aws:iam::123456789012:policy/BroadKmsPol",
+            "DefaultVersionId": "v2",
+            "PolicyVersionList": [{
+                "VersionId": "v2",
+                "IsDefaultVersion": True,
+                "Document": {
+                    "Version": "2012-10-17",
+                    "Statement": [{"Effect": "Allow", "Action": ["kms:Decrypt", "kms:DescribeKey"], "Resource": "*"}],
+                },
+            }],
+        }]
+    }), encoding="utf-8")
+
+    (aws_dir / "05_roles.json").write_text(json.dumps({
+        "Roles": [{
+            "RoleName": "etl-role",
+            "Arn": "arn:aws:iam::123456789012:role/eks/etl-role",
+            "AssumeRolePolicyDocument": trust_doc,
+            "AttachedManagedPolicies": [{"PolicyName": "BroadKmsPol", "PolicyArn": "arn:aws:iam::123456789012:policy/BroadKmsPol"}],
+        }]
+    }), encoding="utf-8")
+
+    (aws_dir / "06_keys.json").write_text(json.dumps({
+        "Region": "us-east-1",
+        "Keys": [
+            {"KeyId": "aws-managed-s3", "KeyMetadata": {"KeyManager": "AWS", "Arn": "arn:aws:kms:us-east-1:123456789012:key/aws-managed-s3"}},
+            {"KeyId": "key-uuid-1", "KeyArn": "arn:aws:kms:us-east-1:123456789012:key/key-uuid-1", "Alias": "alias/pii-cmk", "KeyManager": "CUSTOMER", "KeyRotationEnabled": False},
+        ],
+    }), encoding="utf-8")
+
+    (aws_dir / "07_buckets.json").write_text(json.dumps({
+        "Buckets": [{
+            "Name": "pii-vault",
+            "Arn": "arn:aws:s3:::pii-vault",
+            "PublicAccessBlockConfiguration": {"BlockPublicAcls": True, "BlockPublicPolicy": True, "IgnorePublicAcls": True, "RestrictPublicBuckets": True},
+            "Logging": None,
+        }]
+    }), encoding="utf-8")
+
+    parser = AwsJsonParser()
+    parser.parse_directory(str(tmp_path))
+    assert len(parser.roles) == 1
+    assert len(parser.policies) == 1
+    assert len(parser.kms_keys) == 1  # AWS-managed key skipped
+    assert len(parser.s3_buckets) == 1
+    assert parser.s3_buckets[0].kms_key_arn == "arn:aws:kms:us-east-1:123456789012:key/key-uuid-1"
+    assert parser.s3_buckets[0].properties.get("has_lifecycle") is None
+
+    capsys.readouterr()
+    rc = ai_cspm.run_scan(target_dir=str(tmp_path), offline_mode=True, format_type="json", apply_fix=True)
+    assert rc == 1
+    res = json.loads(capsys.readouterr().out)
+    assert res["metrics"]["critical_attack_paths"] == 1
+    finding_ids = {m["id"] for m in res["misconfigurations"]}
+    assert {"SEC-IAM-001", "SEC-IAM-002", "SEC-KMS-001", "SEC-KMS-002", "SEC-S3-002", "SEC-CROSS-001", "SEC-CROSS-002"} <= finding_ids
+    assert "SEC-S3-003" not in finding_ids
+    assert '"arn:aws:kms:us-east-1:123456789012:key/key-uuid-1"' in res["remediation"]["remediated_code"]
+    assert '"arn:aws:s3:::pii-vault"' in res["remediation"]["remediated_code"]
+    # Snapshot policies JSON must not be clobbered by --apply-fix; TF patch is emitted instead
+    assert "Policies" in json.loads((aws_dir / "04_policies.json").read_text(encoding="utf-8"))
+    assert (tmp_path / "remediated_snapshot_least_privilege.tf").is_file()
+
+
+def test_explicit_s3_principal_wildcard_enc_ctx_actions_and_consensus_vector():
+    from core.models import statement_has_encryption_context
+    from ai.prompt_templates import build_scoped_kms_policy_hcl
+
+    # 1. Wildcard EncryptionContext values ('*' or mixed '*') must not pass validation
+    assert statement_has_encryption_context(PolicyStatement(
+        effect="Allow",
+        actions=["kms:Decrypt"],
+        resources=["*"],
+        conditions={"StringEquals": {"kms:EncryptionContext:aws:s3:arn": "*"}},
+    )) is False
+    assert statement_has_encryption_context(PolicyStatement(
+        effect="Allow",
+        actions=["kms:Decrypt"],
+        resources=["*"],
+        conditions={"StringEquals": {"kms:EncryptionContext:aws:s3:arn": ["arn:aws:s3:::ok", "*"]}},
+    )) is False
+    assert statement_has_encryption_context(PolicyStatement(
+        effect="Allow",
+        actions=["kms:Decrypt"],
+        resources=["*"],
+        conditions={"StringEquals": {"kms:EncryptionContext:aws:s3:arn": "arn:aws:s3:::ok"}},
+    )) is True
+
+    # 2. Explicit IAM Role Principal on S3 Bucket Policy (no wildcard '*') must NOT trigger attack edge
+    cg = ContextualGraph()
+    r = IAMRoleNode(id="r1", name="pay-role", role_arn="arn:aws:iam::123456789012:role/pay-role")
+    b_scoped = S3BucketNode(
+        id="b1",
+        name="pay-vault",
+        bucket_name="pay-vault",
+        bucket_arn="arn:aws:s3:::pay-vault",
+        properties={
+            "bucket_policy_statements": [{
+                "effect": "Allow",
+                "principal": {"AWS": "arn:aws:iam::123456789012:role/pay-role"},
+                "actions": ["s3:GetObject", "s3:PutObject"],
+                "resources": ["arn:aws:s3:::pay-vault/*"],
+            }]
+        },
+    )
+    cg.build_from_parsed([], [], [r], [], [], [b_scoped], [])
+    assert not cg.graph.has_edge("r1", "b1")
+
+    # 3. S3 remediation preserves non-wildcard edge actions & consensus aligns with vector_type
+    s3_nodes = [
+        {"id": "w", "name": "api", "type": "WORKLOAD"},
+        {"id": "sa", "name": "sa", "type": "SERVICE_ACCOUNT"},
+        {"id": "r1", "name": "pay-role", "type": "IAM_ROLE", "role_arn": "arn:aws:iam::123456789012:role/pay-role"},
+        {"id": "b1", "name": "staging", "type": "S3_BUCKET", "bucket_arn": "arn:aws:s3:::staging", "allowed_actions": ["s3:GetObject", "s3:ListBucket"]},
+    ]
+    hcl = build_scoped_kms_policy_hcl(s3_nodes)
+    assert '["s3:GetObject", "s3:ListBucket"]' in hcl
+    assert "NOTE:" in hcl
+
+    consensus = MultiAgentConsensusEngine(offline_mode=True)
+    res_s3 = consensus.run_consensus_evaluation({
+        "id": "AP-001",
+        "title": "S3 exposure",
+        "nodes": s3_nodes,
+    })
+    assert "kms:Decrypt on wildcard '*'" not in res_s3["red_team"]["attack_vector_en"]
+    assert "S3 Bucket Policy" in res_s3["red_team"]["attack_vector_en"]
+
+    kms_nodes = [
+        {"id": "w", "name": "api", "type": "WORKLOAD"},
+        {"id": "sa", "name": "sa", "type": "SERVICE_ACCOUNT"},
+        {"id": "r1", "name": "pay-role", "type": "IAM_ROLE", "role_arn": "arn:aws:iam::123456789012:role/pay-role"},
+        {"id": "k1", "name": "cmk", "type": "KMS_KEY", "key_arn": "arn:aws:kms:us-east-1:123456789012:key/k1"},
+    ]
+    res_kms = consensus.run_consensus_evaluation({"id": "AP-002", "title": "KMS key policy", "nodes": kms_nodes})
+    assert "KMS Key Resource Policy" in res_kms["red_team"]["attack_vector_en"]

@@ -3,6 +3,8 @@ AI-CSPM Core Data Models
 Defines semantic graph nodes, edge types, attack path models, and remediation schemas.
 """
 
+import json
+import urllib.parse
 from enum import Enum
 from typing import Dict, List, Optional, Any
 from pydantic import BaseModel, Field
@@ -76,6 +78,87 @@ class PolicyStatement(BaseModel):
     conditions: Dict[str, Any] = Field(default_factory=dict)
 
 
+def decode_policy_document(raw_doc: Any) -> Dict[str, Any]:
+    """Decodes an IAM/resource policy document from dict, JSON string, or URL-encoded JSON string."""
+    if isinstance(raw_doc, dict):
+        return raw_doc
+    if not isinstance(raw_doc, str) or not raw_doc.strip():
+        return {}
+    text = raw_doc.strip()
+    if text.startswith("%"):
+        text = urllib.parse.unquote(text)
+    try:
+        parsed = json.loads(text)
+        return parsed if isinstance(parsed, dict) else {}
+    except Exception:
+        return {}
+
+
+def parse_policy_statements(raw_stmts_or_doc: Any) -> List[PolicyStatement]:
+    """Normalizes IAM/KMS/S3 policy statements from a policy dict, JSON string, or statement list."""
+    if isinstance(raw_stmts_or_doc, str):
+        raw_stmts_or_doc = decode_policy_document(raw_stmts_or_doc)
+    if isinstance(raw_stmts_or_doc, dict):
+        raw_stmts: Any = (
+            raw_stmts_or_doc.get("Statement", [])
+            if "Statement" in raw_stmts_or_doc
+            else raw_stmts_or_doc
+        )
+    else:
+        raw_stmts = raw_stmts_or_doc
+
+    if isinstance(raw_stmts, dict):
+        raw_stmts = [raw_stmts]
+    elif not isinstance(raw_stmts, list):
+        return []
+
+    def _as_list(val: Any) -> List[str]:
+        if isinstance(val, str):
+            return [val]
+        return list(val) if isinstance(val, list) else []
+
+    parsed: List[PolicyStatement] = []
+    for stmt in raw_stmts:
+        if isinstance(stmt, PolicyStatement):
+            parsed.append(stmt)
+            continue
+        if not isinstance(stmt, dict):
+            continue
+        parsed.append(PolicyStatement(
+            sid=stmt.get("Sid"),
+            effect=stmt.get("Effect", "Allow"),
+            principal=stmt.get("Principal"),
+            actions=_as_list(stmt.get("Action")),
+            not_actions=_as_list(stmt.get("NotAction")),
+            resources=_as_list(stmt.get("Resource")),
+            not_resources=_as_list(stmt.get("NotResource")),
+            conditions=stmt.get("Condition") or {},
+        ))
+    return parsed
+
+
+def extract_federated_oidc_provider(trust_doc: Any) -> Optional[str]:
+    """Extracts the Federated OIDC principal string from an IAM AssumeRolePolicyDocument if present."""
+    doc = decode_policy_document(trust_doc) if isinstance(trust_doc, str) else trust_doc
+    if not isinstance(doc, dict):
+        return None
+    stmts = doc.get("Statement", [])
+    if isinstance(stmts, dict):
+        stmts = [stmts]
+    if not isinstance(stmts, list):
+        return None
+    for stmt in stmts:
+        if not isinstance(stmt, dict):
+            continue
+        principal = stmt.get("Principal") or {}
+        if isinstance(principal, dict) and "Federated" in principal:
+            fed = principal["Federated"]
+            if isinstance(fed, list):
+                return str(fed[0]) if fed else None
+            return str(fed)
+    return None
+
+
 _RESTRICTIVE_CONDITION_OPS = {
     "stringequals",
     "stringequalsifexists",
@@ -111,8 +194,18 @@ def resource_matches_kms_wildcard(resource: str) -> bool:
     return False
 
 
+def _is_scoped_condition_value(val: Any) -> bool:
+    """Returns True if a condition value is non-empty and contains no bare wildcard '*'."""
+    if isinstance(val, str):
+        s = val.strip()
+        return bool(s) and s != "*"
+    if isinstance(val, list):
+        return bool(val) and all(_is_scoped_condition_value(item) for item in val)
+    return val is not None
+
+
 def statement_has_encryption_context(stmt: PolicyStatement) -> bool:
-    """Returns True if a PolicyStatement restricts usage via a positive kms:EncryptionContext condition."""
+    """Returns True if a PolicyStatement restricts usage via a positive non-wildcard kms:EncryptionContext condition."""
     if not stmt.conditions or not isinstance(stmt.conditions, dict):
         return False
     for cond_op, cond_dict in stmt.conditions.items():
@@ -121,7 +214,7 @@ def statement_has_encryption_context(stmt: PolicyStatement) -> bool:
             continue
         if isinstance(cond_dict, dict):
             for k, v in cond_dict.items():
-                if "encryptioncontext" in str(k).lower() and v not in (None, "", []):
+                if "encryptioncontext" in str(k).lower() and _is_scoped_condition_value(v):
                     return True
     return False
 

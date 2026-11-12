@@ -43,6 +43,7 @@ from core.graph import ContextualGraph
 from core.analyzer import AttackPathAnalyzer
 from ingestion.k8s_parser import K8sParser
 from ingestion.tf_parser import TerraformParser
+from ingestion.aws_json_parser import AwsJsonParser
 from ingestion.live_cloud_parser import LiveCloudFetcher
 from ai.engine import AIRemediationEngine
 from ai.multi_agent_consensus import MultiAgentConsensusEngine
@@ -188,9 +189,28 @@ def run_scan(
                     k8s.parse_file(os.path.join(root, f))
 
         if format_type == "console":
-            console.print("→ [yellow]Parsing Terraform Infrastructure-as-Code (HCL) & Cloud policies...[/]")
+            console.print("→ [yellow]Parsing Terraform Infrastructure-as-Code (HCL) & exported AWS JSON snapshots...[/]")
         tf = TerraformParser()
         tf.parse_directory(target_dir)
+
+        aws_json = AwsJsonParser()
+        aws_json.parse_directory(target_dir)
+
+        def _merge_nodes(primary, extra):
+            seen = {n.id for n in primary}
+            return list(primary) + [n for n in extra if n.id not in seen]
+
+        merged_roles = _merge_nodes(tf.roles, aws_json.roles)
+        merged_policies = _merge_nodes(tf.policies, aws_json.policies)
+        merged_kms = _merge_nodes(tf.kms_keys, aws_json.kms_keys)
+        merged_buckets = _merge_nodes(tf.s3_buckets, aws_json.s3_buckets)
+        merged_attachments = list(tf.attachments)
+        seen_att = {(a.get("role"), a.get("policy")) for a in merged_attachments}
+        for att in aws_json.attachments:
+            pair = (att.get("role"), att.get("policy"))
+            if pair not in seen_att:
+                seen_att.add(pair)
+                merged_attachments.append(att)
 
         # 2. Build Contextual Directed Acyclic Graph (DAG)
         if format_type == "console":
@@ -199,14 +219,15 @@ def run_scan(
         cg.build_from_parsed(
             workloads=k8s.workloads,
             service_accounts=k8s.service_accounts,
-            roles=tf.roles,
-            policies=tf.policies,
-            kms_keys=tf.kms_keys,
-            s3_buckets=tf.s3_buckets,
-            attachments=tf.attachments
+            roles=merged_roles,
+            policies=merged_policies,
+            kms_keys=merged_kms,
+            s3_buckets=merged_buckets,
+            attachments=merged_attachments
         )
         analyzer = AttackPathAnalyzer(cg, tf_parser=tf, k8s_parser=k8s)
         parse_warnings.extend(getattr(tf, "parse_warnings", []))
+        parse_warnings.extend(getattr(aws_json, "parse_warnings", []))
 
     if format_type == "console" and parse_warnings:
         for pw in parse_warnings:
@@ -525,6 +546,11 @@ def run_scan(
                 patch_file = apply_auto_remediation(target_dir, rem, attack_path=ap)
                 if patch_file and patch_file not in patched_files:
                     patched_files.append(patch_file)
+            if not patched_files and aws_json.roles:
+                snap_patch = os.path.join(target_dir, "remediated_snapshot_least_privilege.tf")
+                with open(snap_patch, "w", encoding="utf-8") as f:
+                    f.write("\n\n".join(r.remediated_code for r in remediations))
+                patched_files.append(snap_patch)
             if format_type == "console" and patched_files:
                 console.print(Panel(
                     f"[bold green]✔ Automated Least-Privilege Terraform Patch Written to:[/] \n[cyan]{', '.join(patched_files)}[/]\n\n"

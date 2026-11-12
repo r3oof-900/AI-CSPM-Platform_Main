@@ -160,7 +160,14 @@ def build_scoped_kms_policy_hcl(nodes: list) -> str:
     role_name = "authorized_role"
     role_arn = None
     has_bucket = False
+    has_tf_source = False
+    has_json_arn_source = False
     for n in nodes or []:
+        src = str(n.get("source_file") or "").lower()
+        if src.endswith(".tf"):
+            has_tf_source = True
+        elif src.endswith(".json") and (n.get("key_arn") or n.get("bucket_arn") or n.get("role_arn")):
+            has_json_arn_source = True
         ntype = str(n.get("type", ""))
         if ntype in ("KMS_KEY", "NodeType.KMS_KEY") and n.get("key_arn"):
             key_arn = n["key_arn"]
@@ -172,15 +179,30 @@ def build_scoped_kms_policy_hcl(nodes: list) -> str:
             role_name = n.get("name") or role_name
             role_arn = n.get("role_arn")
 
+    use_explicit_arns = is_live or (has_json_arn_source and not has_tf_source)
     bucket_tf_ident = _sanitize_tf_ident(bucket_name, "target_vault")
     key_tf_ident = _sanitize_tf_ident(key_name.split("/")[-1], "target_cmk")
-    bucket_expr = f'"{bucket_arn}"' if (is_live and bucket_arn) else (f'"arn:aws:s3:::{bucket_name}"' if is_live else f"aws_s3_bucket.{bucket_tf_ident}.arn")
+    bucket_expr = (
+        f'"{bucket_arn}"'
+        if (use_explicit_arns and bucket_arn)
+        else (f'"arn:aws:s3:::{bucket_name}"' if use_explicit_arns else f"aws_s3_bucket.{bucket_tf_ident}.arn")
+    )
 
     if vector_type == "s3_resource_policy":
-        principal_expr = f'"{role_arn}"' if (is_live and role_arn) else (f'"{role_name}"' if is_live else f"aws_iam_role.{_sanitize_tf_ident(role_name, 'role')}.arn")
-        bucket_ref_id = f'"{bucket_name}"' if is_live else f"aws_s3_bucket.{bucket_tf_ident}.id"
-        s3_obj_resource = f"{bucket_expr.strip(chr(34))}/*" if is_live else f"${{{bucket_expr}}}/*"
-        return f"""resource "aws_s3_bucket_policy" "scoped_{bucket_tf_ident}_policy" {{
+        principal_expr = (
+            f'"{role_arn}"'
+            if (use_explicit_arns and role_arn)
+            else (f'"{role_name}"' if use_explicit_arns else f"aws_iam_role.{_sanitize_tf_ident(role_name, 'role')}.arn")
+        )
+        bucket_ref_id = f'"{bucket_name}"' if use_explicit_arns else f"aws_s3_bucket.{bucket_tf_ident}.id"
+        s3_obj_resource = f"{bucket_expr.strip(chr(34))}/*" if use_explicit_arns else f"${{{bucket_expr}}}/*"
+        preserved_actions = next(
+            (n.get("allowed_actions") for n in (nodes or []) if n.get("allowed_actions")),
+            None,
+        )
+        s3_actions_json = json.dumps(preserved_actions or ["s3:GetObject"])
+        return f"""# NOTE: Confirm this IAM role legitimately requires bucket access; otherwise remove the Allow statement instead.
+resource "aws_s3_bucket_policy" "scoped_{bucket_tf_ident}_policy" {{
   bucket = {bucket_ref_id}
 
   policy = jsonencode({{
@@ -192,7 +214,7 @@ def build_scoped_kms_policy_hcl(nodes: list) -> str:
         Principal = {{
           AWS = {principal_expr}
         }}
-        Action   = ["s3:GetObject"]
+        Action   = {s3_actions_json}
         Resource = "{s3_obj_resource}"
         Condition = {{
           StringEquals = {{
@@ -205,7 +227,11 @@ def build_scoped_kms_policy_hcl(nodes: list) -> str:
 }}"""
 
     if vector_type == "kms_resource_policy":
-        principal_expr = f'"{role_arn}"' if (is_live and role_arn) else (f'"{role_name}"' if is_live else f"aws_iam_role.{_sanitize_tf_ident(role_name, 'role')}.arn")
+        principal_expr = (
+            f'"{role_arn}"'
+            if (use_explicit_arns and role_arn)
+            else (f'"{role_name}"' if use_explicit_arns else f"aws_iam_role.{_sanitize_tf_ident(role_name, 'role')}.arn")
+        )
         enc_cond_block = (
             f"""
         Condition = {{
@@ -250,7 +276,7 @@ def build_scoped_kms_policy_hcl(nodes: list) -> str:
     if not clean_policy_res.startswith("scoped_"):
         clean_policy_res = f"scoped_{clean_policy_res}"
 
-    if is_live:
+    if use_explicit_arns:
         if key_arn:
             resource_expr = f'"{key_arn}"'
         elif key_name.startswith("arn:"):
