@@ -79,12 +79,43 @@ class AIRemediationEngine:
                 if not source_file and sf:
                     source_file = sf
 
+        def _find_hcl_block_span(content_str: str, target: str, res_type: Optional[str] = None) -> Optional[str]:
+            """Extracts only the contiguous HCL resource/data block matching target without leaking full file."""
+            lines = content_str.splitlines()
+            start_idx = None
+            brace_depth = 0
+            clean_target = target.split("/")[-1].lower()
+
+            for i, line in enumerate(lines):
+                stripped = line.strip()
+                if start_idx is None:
+                    if (stripped.startswith("resource ") or stripped.startswith("data ")) and "{" in stripped:
+                        if res_type and res_type not in stripped:
+                            continue
+                        if clean_target in stripped.lower():
+                            start_idx = i
+                            brace_depth = stripped.count("{") - stripped.count("}")
+                            if brace_depth == 0:
+                                return line
+                else:
+                    brace_depth += line.count("{") - line.count("}")
+                    if brace_depth <= 0:
+                        return "\n".join(lines[start_idx:i + 1])
+            return None
+
         def _sanitize_for_llm(text: str) -> str:
-            """Masks secrets, passwords, access keys, and tokens from code before passing to external LLM."""
+            """Masks secrets, passwords, access keys, private keys, and tokens from code before passing to external LLM."""
+            if not text:
+                return text
+            masked = re.sub(r"\b(AKIA|ABIA|ACCA|ASIA)[A-Z0-9]{16}\b", "[REDACTED_BY_AI_CSPM]", text)
+            masked = re.sub(r"\bghp_[a-zA-Z0-9]{36}\b", "[REDACTED_BY_AI_CSPM]", masked)
+            masked = re.sub(r"\bBearer\s+[a-zA-Z0-9_\-\.]{20,}\b", "Bearer [REDACTED_BY_AI_CSPM]", masked, flags=re.IGNORECASE)
+            masked = re.sub(r"-----BEGIN (?:RSA |EC |DSA |OPENSSH )?PRIVATE KEY-----.*?-----END (?:RSA |EC |DSA |OPENSSH )?PRIVATE KEY-----", "[REDACTED_BY_AI_CSPM]", masked, flags=re.DOTALL)
+
             sanitized_lines = []
-            for line in text.splitlines():
+            for line in masked.splitlines():
                 lower_l = line.lower()
-                if any(sec in lower_l for sec in ("password", "secret_key", "access_token", "private_key", "apikey", "api_key", "secret_access_key")):
+                if any(sec in lower_l for sec in ("password", "secret", "access_token", "private_key", "apikey", "api_key", "token")):
                     if "=" in line or ":" in line:
                         parts = re.split(r"(=|:)", line, maxsplit=1)
                         sanitized_lines.append(f"{parts[0]}{parts[1]} \"[REDACTED_BY_AI_CSPM]\"")
@@ -104,7 +135,7 @@ class AIRemediationEngine:
                     expected_kw = (
                         "aws_s3_bucket_policy"
                         if vector_type == "s3_resource_policy"
-                        else ("aws_kms_key" if vector_type == "kms_resource_policy" else None)
+                        else ("aws_kms_key" if vector_type == "kms_resource_policy" else "aws_iam_policy")
                     )
                     if expected_kw and expected_kw not in content:
                         src_dir = os.path.dirname(source_file)
@@ -115,9 +146,13 @@ class AIRemediationEngine:
                                     with open(cand, "r", encoding="utf-8") as cf:
                                         c_txt = cf.read()
                                     if expected_kw in c_txt:
-                                        return _sanitize_for_llm(c_txt)
+                                        block = _find_hcl_block_span(c_txt, target_name, expected_kw) or _find_hcl_block_span(c_txt, "", expected_kw)
+                                        return _sanitize_for_llm(block or c_txt)
                                 except Exception:
                                     pass
+                    block = _find_hcl_block_span(content, target_name, expected_kw)
+                    if block:
+                        return _sanitize_for_llm(block)
                     return _sanitize_for_llm(content)
             except Exception:
                 pass
@@ -125,7 +160,11 @@ class AIRemediationEngine:
         if fallback_source and fallback_source.endswith(".tf"):
             try:
                 with open(fallback_source, "r", encoding="utf-8") as f:
-                    return _sanitize_for_llm(f.read())
+                    content = f.read()
+                block = _find_hcl_block_span(content, target_name)
+                if block:
+                    return _sanitize_for_llm(block)
+                return _sanitize_for_llm(content)
             except Exception:
                 pass
 
@@ -255,7 +294,7 @@ class AIRemediationEngine:
                 f"Replaced unconstrained wildcard Resource ('*') with explicit CMK ARN for '{key_name}'.",
                 f"Enforced kms:EncryptionContext condition matching 'aws:s3:arn' of bucket '{bucket_name}'.",
                 "Eliminated lateral movement capability to other tenant databases and KMS keys.",
-                "Neutralized the 100% false-negative blindspot of Prowler, Checkov, and AWS Access Analyzer."
+                "Neutralized the multi-tier blindspot of single-layer posture scanners and isolated IaC linters."
             ]
             risk_reduction = "Blast radius reduced from 100% of all tenant cryptographic keys to exactly 1 authorized CMK (99.9% containment)."
 

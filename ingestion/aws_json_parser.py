@@ -62,6 +62,7 @@ class AwsJsonParser:
         self.kms_keys: List[KMSKeyNode] = []
         self.s3_buckets: List[S3BucketNode] = []
         self.attachments: List[Dict[str, str]] = []
+        self.parse_errors: List[str] = []
         self.parse_warnings: List[str] = []
 
         self.account_id: str = "123456789012"
@@ -110,7 +111,7 @@ class AwsJsonParser:
             with open(filepath, "r", encoding="utf-8") as f:
                 data = json.load(f)
         except Exception as exc:
-            self.parse_warnings.append(f"Skipping invalid JSON {os.path.basename(filepath)}: {exc}")
+            self.parse_errors.append(f"Skipping invalid JSON {os.path.basename(filepath)}: {exc}")
             return False
 
         if not isinstance(data, dict) or "Statement" in data:

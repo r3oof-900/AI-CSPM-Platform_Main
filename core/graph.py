@@ -23,6 +23,9 @@ from .models import (
     statement_has_principal_or_source_restriction,
     statement_has_wildcard_kms_resource,
     statement_targets_kms_key,
+    statement_allows_s3_object_read,
+    statement_denies_s3_object_read,
+    s3_resource_hits_bucket,
 )
 
 
@@ -161,21 +164,21 @@ def _kms_ref_matches_key(ref: str, key: KMSKeyNode) -> bool:
 class ContextualGraph:
     def __init__(self):
         self.graph = nx.DiGraph()
+        self.warnings: List[str] = []
+        self.parse_errors: List[str] = []
 
     def add_node(self, node: BaseNode):
         """Adds a typed semantic node to the graph with collision protection."""
         node_id = node.id
         if self.graph.has_node(node_id):
-            existing_attrs = self.graph.nodes[node_id]
-            if existing_attrs.get("source_file") == node.source_file and existing_attrs.get("name") == node.name:
+            old = self.graph.nodes[node_id].get("obj")
+            if old is not None and hasattr(old, "model_dump") and hasattr(node, "model_dump"):
+                if old.model_dump() == node.model_dump():
+                    return
+            elif self.graph.nodes[node_id].get("source_file") == node.source_file and self.graph.nodes[node_id].get("name") == node.name:
                 return
-            idx = 2
-            cand_id = f"{node_id}:{idx}"
-            while self.graph.has_node(cand_id):
-                idx += 1
-                cand_id = f"{node_id}:{idx}"
-            node_id = cand_id
-            node.id = node_id
+            self.warnings.append(f"ID collision {node.id}: kept first, dropped '{node.name}' ({node.source_file})")
+            return
 
         self.graph.add_node(
             node_id,
@@ -364,6 +367,7 @@ class ContextualGraph:
         # 4b. Compute Role-Level Unconditional Deny across ALL attached policies per IAM Role
         for r in roles:
             r_denied_key_ids = set()
+            r_denied_bucket_ids = set()
             for p_id in self.graph.successors(r.id):
                 p_obj = self.graph.nodes[p_id].get("obj")
                 if not p_obj:
@@ -373,7 +377,22 @@ class ContextualGraph:
                         for k in kms_keys:
                             if statement_targets_kms_key(stmt, lambda ref, key=k: _kms_ref_matches_key(ref, key)):
                                 r_denied_key_ids.add(k.id)
+                    if statement_denies_s3_object_read(stmt):
+                        for b in s3_buckets:
+                            hits_any = False
+                            for res in (stmt.resources or []):
+                                hits_b, _ = s3_resource_hits_bucket(res, b.bucket_name)
+                                if hits_b:
+                                    hits_any = True
+                                    break
+                            if hits_any:
+                                r_denied_bucket_ids.add(b.id)
+                            elif stmt.not_resources:
+                                hits_not = any(s3_resource_hits_bucket(nr, b.bucket_name)[0] for nr in stmt.not_resources)
+                                if not hits_not:
+                                    r_denied_bucket_ids.add(b.id)
             self.graph.nodes[r.id]["denied_kms_key_ids"] = r_denied_key_ids
+            self.graph.nodes[r.id]["denied_s3_bucket_ids"] = r_denied_bucket_ids
 
         # 5. Link IAM Policy -> KMS Key (Respecting Deny, NotResource, & Merging Multi-Statement Edges)
         for p in policies:
@@ -457,34 +476,42 @@ class ContextualGraph:
                             )
 
         # 5c. Link Direct IAM Policy -> S3 Bucket (Direct S3 Storage Access via IAM Policy)
-        def _policy_stmt_allows_s3_read(s: PolicyStatement) -> bool:
-            if s.actions:
-                return any(str(a).strip().lower() in ("*", "s3:*", "s3:getobject", "s3:get*", "s3:listbucket") for a in s.actions)
-            if s.not_actions:
-                return not any(str(a).strip().lower() in ("*", "s3:*", "s3:getobject") for a in s.not_actions)
-            return False
-
-        def _stmt_targets_bucket(s: PolicyStatement, bucket: S3BucketNode) -> tuple:
-            b_arn = bucket.bucket_arn or f"arn:aws:s3:::{bucket.bucket_name}"
-            b_clean = b_arn.rstrip("/")
-            for res in s.resources:
-                r_s = str(res).strip()
-                if r_s == "*":
-                    return True, True
-                if r_s == b_clean or r_s.startswith(f"{b_clean}/") or bucket.bucket_name in r_s:
-                    return True, False
-            if s.not_resources:
-                if any(str(nr).strip() == "*" for nr in s.not_resources):
-                    return False, False
-                return True, True
-            return False, False
-
         for p in policies:
+            denied_bucket_ids = set()
             for stmt in p.statements:
-                if stmt.effect.strip().lower() != "allow" or not _policy_stmt_allows_s3_read(stmt):
+                if statement_denies_s3_object_read(stmt):
+                    for b in s3_buckets:
+                        for res in (stmt.resources or []):
+                            hits, _ = s3_resource_hits_bucket(res, b.bucket_name)
+                            if hits:
+                                denied_bucket_ids.add(b.id)
+                        if stmt.not_resources:
+                            hits_not = any(s3_resource_hits_bucket(nr, b.bucket_name)[0] for nr in stmt.not_resources)
+                            if not hits_not:
+                                denied_bucket_ids.add(b.id)
+
+            for stmt in p.statements:
+                if not statement_allows_s3_object_read(stmt):
                     continue
                 for b in s3_buckets:
-                    targets_b, is_wild = _stmt_targets_bucket(stmt, b)
+                    if b.id in denied_bucket_ids:
+                        continue
+                    targets_b = False
+                    is_wild = False
+                    for res in stmt.resources:
+                        hits, wild = s3_resource_hits_bucket(res, b.bucket_name)
+                        if hits:
+                            targets_b = True
+                            if wild:
+                                is_wild = True
+                    if stmt.not_resources:
+                        if any(str(nr).strip() == "*" for nr in stmt.not_resources):
+                            targets_b = False
+                        else:
+                            hits_not = any(s3_resource_hits_bucket(nr, b.bucket_name)[0] for nr in stmt.not_resources)
+                            if not hits_not:
+                                targets_b = True
+                                is_wild = True
                     if targets_b:
                         is_lethal = is_wild and not statement_has_principal_or_source_restriction(stmt.conditions)
                         if not self.graph.has_edge(p.id, b.id):
@@ -511,13 +538,6 @@ class ContextualGraph:
                     self.add_edge(k.id, b.id, EdgeType.ENCRYPTS_BUCKET)
 
         # 6b. Link Direct S3 Bucket Resource Policy Grants (IAMRole -> S3Bucket), respecting Denies & not masked by KMS path
-        def _s3_stmt_allows_read(s: PolicyStatement) -> bool:
-            if s.actions:
-                return any(str(a).strip().lower() in ("*", "s3:*", "s3:getobject", "s3:get*") for a in s.actions)
-            if s.not_actions:
-                return not any(str(a).strip().lower() in ("*", "s3:*", "s3:getobject") for a in s.not_actions)
-            return False
-
         for b in s3_buckets:
             raw_b_stmts = b.properties.get("bucket_policy_statements", [])
             parsed_b_stmts = [s if isinstance(s, PolicyStatement) else PolicyStatement(**s) for s in raw_b_stmts]
@@ -526,18 +546,20 @@ class ContextualGraph:
                 if any(
                     ds.effect.strip().lower() == "deny"
                     and not ds.conditions
-                    and _s3_stmt_allows_read(ds)
+                    and statement_denies_s3_object_read(ds)
                     and _principal_matches_role(ds.principal, r)
                     for ds in parsed_b_stmts
                 )
             }
             for stmt in parsed_b_stmts:
-                if stmt.effect.strip().lower() != "allow" or not _s3_stmt_allows_read(stmt):
+                if not statement_allows_s3_object_read(stmt):
                     continue
-                has_conditions = bool(stmt.conditions)
                 has_identity_restriction = statement_has_principal_or_source_restriction(stmt.conditions)
                 for r in roles:
                     if r.id in b_denied_roles:
+                        continue
+                    r_attrs = self.graph.nodes[r.id]
+                    if b.id in r_attrs.get("denied_s3_bucket_ids", set()):
                         continue
                     match_kind = _principal_matches_role(stmt.principal, r)
                     if not match_kind:

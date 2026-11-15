@@ -484,7 +484,7 @@ class LiveCloudFetcher:
                             for att_pol in att_page.get("AttachedPolicies", []):
                                 pol_name = att_pol["PolicyName"]
                                 pol_arn = att_pol["PolicyArn"]
-                                pol_node_id = f"aws:iam:policy:{pol_name}"
+                                pol_node_id = f"aws:iam:policy:{pol_arn}"
                                 self.attachments.append({"role": role_name, "policy": pol_node_id})
 
                                 if pol_arn in seen_managed_policies:
@@ -777,7 +777,7 @@ class LiveCloudFetcher:
             volumes_list.append(v_dict)
 
         self.workloads.append(WorkloadNode(
-            id=f"k8s:workload:{ns}:{name}",
+            id=f"k8s:workload:{ns}:{kind.lower()}:{name}",
             name=name,
             layer="Kubernetes",
             namespace=ns,
@@ -1165,7 +1165,7 @@ class LiveCloudFetcher:
                     image = containers[0].get("image", "unknown")
 
                     self.workloads.append(WorkloadNode(
-                        id=f"k8s:workload:{ns}:{name}",
+                        id=f"k8s:workload:{ns}:{kind_label.lower()}:{name}",
                         name=name,
                         layer="Kubernetes",
                         namespace=ns,
@@ -1346,7 +1346,7 @@ class LiveCloudFetcher:
             conditions={}
         )
         self.policies.append(IAMPolicyNode(
-            id=f"aws:iam:policy:{policy_name}",
+            id=f"aws:iam:policy:{policy_arn}",
             name=policy_name,
             layer="IAM",
             policy_arn=policy_arn,
@@ -1359,7 +1359,7 @@ class LiveCloudFetcher:
         # 5. Attachment
         self.attachments.append({
             "role": "eks-payment-processor-live-role",
-            "policy": policy_name
+            "policy": policy_arn
         })
 
         # 6. Live KMS CMK Key

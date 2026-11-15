@@ -20,6 +20,8 @@ class K8sParser:
         self.network_policies: Dict[str, List[Dict[str, Any]]] = {}  # namespace -> list of policies
         self.roles: Dict[str, Dict[str, Any]] = {}                    # "namespace:name" -> role data
         self.role_bindings: List[Dict[str, Any]] = []
+        self.parse_errors: List[str] = []
+        self.parse_warnings: List[str] = []
 
     def parse_file(self, filepath: str) -> Tuple[List[WorkloadNode], List[ServiceAccountNode]]:
         """Parses a Kubernetes multi-document YAML file."""
@@ -30,7 +32,7 @@ class K8sParser:
             try:
                 documents = list(yaml.safe_load_all(f))
             except Exception as e:
-                print(f"[!] Error parsing K8s YAML {filepath}: {e}")
+                self.parse_errors.append(f"Error parsing K8s YAML {filepath}: {e}")
                 return [], []
 
         file_workloads = []

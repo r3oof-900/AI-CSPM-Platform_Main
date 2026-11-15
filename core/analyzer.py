@@ -35,7 +35,7 @@ class AttackPathAnalyzer:
 
     def find_cross_layer_attack_paths(self, cutoff: int = 8) -> List[AttackPath]:
         """Discovers all viable paths from Kubernetes Workloads to sensitive Cloud Vaults."""
-        attack_paths: List[AttackPath] = []
+        raw_attack_paths: List[AttackPath] = []
 
         # 1. Identify start nodes (Workloads)
         workloads = [
@@ -73,10 +73,17 @@ class AttackPathAnalyzer:
                         nid for nid in simple_path
                         if self.graph.nodes[nid].get("node_type") == NodeType.KMS_KEY.value
                     }
+                    bucket_ids_in_path = {
+                        nid for nid in simple_path
+                        if self.graph.nodes[nid].get("node_type") == NodeType.S3_BUCKET.value
+                    }
                     blocked_by_role_deny = False
                     for r_id in role_ids_in_path:
                         r_attrs = self.graph.nodes[r_id]
                         if kms_ids_in_path & set(r_attrs.get("denied_kms_key_ids", set())):
+                            blocked_by_role_deny = True
+                            break
+                        if bucket_ids_in_path & set(r_attrs.get("denied_s3_bucket_ids", set())):
                             blocked_by_role_deny = True
                             break
                     if blocked_by_role_deny:
@@ -88,6 +95,7 @@ class AttackPathAnalyzer:
                     flawed_key_name = None
                     flawed_actions: List[str] = []
                     via_resource_policy = False
+                    is_direct_storage = False
                     for i in range(len(simple_path) - 1):
                         u, v = simple_path[i], simple_path[i + 1]
                         edge_data = self.graph.get_edge_data(u, v, default={})
@@ -97,6 +105,8 @@ class AttackPathAnalyzer:
                             flawed_key_name = self.graph.nodes[v].get("name", v)
                             flawed_actions = edge_data.get("actions") or ["kms:Decrypt"]
                             via_resource_policy = bool(edge_data.get("via_resource_policy"))
+                            if edge_data.get("edge_type") == EdgeType.ALLOWS_STORAGE_ACCESS.value:
+                                is_direct_storage = True
                             break
 
                     if not has_lethal_flaw:
@@ -127,7 +137,7 @@ class AttackPathAnalyzer:
                         elif ntype == NodeType.S3_BUCKET.value and node_obj is not None:
                             node_entry["bucket_arn"] = getattr(node_obj, "bucket_arn", None)
                             node_entry["bucket_name"] = getattr(node_obj, "bucket_name", None)
-                            if via_resource_policy and flawed_actions:
+                            if (via_resource_policy or is_direct_storage) and flawed_actions:
                                 scoped_s3_acts = [a for a in flawed_actions if str(a).strip() not in ("*", "s3:*")]
                                 if scoped_s3_acts:
                                     node_entry["allowed_actions"] = scoped_s3_acts
@@ -145,7 +155,10 @@ class AttackPathAnalyzer:
                             path_steps.append(f"{step_num}. Cloud Identity Escalation: STS WebIdentity federation assumes AWS IAM Role '{name}'.")
                         elif ntype == NodeType.IAM_POLICY.value:
                             act_str = ", ".join(flawed_actions[:3])
-                            path_steps.append(f"{step_num}. Lethal Wildcard Grant: Attached IAM Policy '{name}' permits '{act_str}' on '*' resource without EncryptionContext.")
+                            if is_direct_storage:
+                                path_steps.append(f"{step_num}. Lethal Wildcard Grant: Attached IAM Policy '{name}' permits '{act_str}' on S3 storage without restrictive conditions.")
+                            else:
+                                path_steps.append(f"{step_num}. Lethal Wildcard Grant: Attached IAM Policy '{name}' permits '{act_str}' on '*' resource without EncryptionContext.")
                         elif ntype == NodeType.KMS_KEY.value:
                             if via_resource_policy:
                                 path_steps.append(f"{step_num}. Direct KMS Resource Policy Exposure: KMS Key '{name}' grants decryption directly to role/wildcard without EncryptionContext.")
@@ -154,6 +167,8 @@ class AttackPathAnalyzer:
                         elif ntype == NodeType.S3_BUCKET.value:
                             if via_resource_policy:
                                 path_steps.append(f"{step_num}. Direct S3 Bucket Policy Exposure: Bucket '{name}' permits direct read access without restrictive conditions.")
+                            elif is_direct_storage:
+                                path_steps.append(f"{step_num}. Vault Breach: Direct exfiltration of records in S3 bucket '{name}'.")
                             else:
                                 path_steps.append(f"{step_num}. Vault Breach: Full exfiltration of protected records in S3 bucket '{name}'.")
 
@@ -162,9 +177,10 @@ class AttackPathAnalyzer:
                         if via_resource_policy
                         else f"IAM Policy '{flawed_policy_name}' grants wildcard {', '.join(flawed_actions[:2])} on '*' to an EKS federated role"
                     )
+                    title_type = "Multi-Tier Cloud Storage Exfiltration" if is_direct_storage else "Multi-Tier Cryptographic Exfiltration"
                     ap = AttackPath(
                         id=f"AP-{path_idx:03d}",
-                        title=f"Multi-Tier Cryptographic Exfiltration: {path_nodes[0]['name']} -> {path_nodes[-1]['name']}",
+                        title=f"{title_type}: {path_nodes[0]['name']} -> {path_nodes[-1]['name']}",
                         severity=Severity.CRITICAL,
                         nodes=path_nodes,
                         steps=path_steps,
@@ -183,10 +199,34 @@ class AttackPathAnalyzer:
                             "Siloed IaC analyzers (separate K8s and Terraform into isolated targets)"
                         ]
                     )
-                    attack_paths.append(ap)
+                    raw_attack_paths.append(ap)
                     path_idx += 1
 
-        return attack_paths
+        # Group attack paths sharing the same root-cause flaw / role / flawed policy to prevent combinatorial explosion
+        grouped_dict: Dict[Tuple[str, str, str], List[AttackPath]] = {}
+        for ap in raw_attack_paths:
+            role_name = next((n["name"] for n in ap.nodes if n["type"] == NodeType.IAM_ROLE.value), "role")
+            pol_name = next((n["name"] for n in ap.nodes if n["type"] == NodeType.IAM_POLICY.value), "policy")
+            dest_type = ap.nodes[-1]["type"]
+            group_key = (role_name, pol_name, dest_type)
+            grouped_dict.setdefault(group_key, []).append(ap)
+
+        grouped_paths: List[AttackPath] = []
+        final_idx = 1
+        for group_key, paths in grouped_dict.items():
+            rep = paths[0]
+            affected_w = sorted({p.nodes[0]["name"] for p in paths})
+            exposed_a = sorted({p.nodes[-1]["name"] for p in paths})
+            rep.id = f"AP-{final_idx:03d}"
+            rep.affected_workloads = affected_w
+            rep.exposed_assets = exposed_a
+            if len(affected_w) > 1 or len(exposed_a) > 1:
+                base_title = "Multi-Tier Storage Exfiltration" if "STORAGE" in rep.title.upper() or "S3" in rep.title.upper() else "Multi-Tier Cryptographic Exfiltration"
+                rep.title = f"{base_title} ({len(affected_w)} Workloads -> {len(exposed_a)} Assets): {rep.nodes[0]['name']} -> {rep.nodes[-1]['name']}"
+            grouped_paths.append(rep)
+            final_idx += 1
+
+        return grouped_paths
 
     def audit_all_misconfigurations(
         self,
@@ -343,12 +383,41 @@ class AttackPathAnalyzer:
                         for stmt in (trust_policy.get("Statement", []) if isinstance(trust_policy.get("Statement"), list) else [trust_policy.get("Statement", {})])
                         if isinstance(stmt, dict)
                     )
-                    title_text = "IAM Federated Execution Role Missing Permissions Boundary" if is_fed else "IAM Workload/Application Role Missing Permissions Boundary"
+                    is_pure_service = False
+                    if not is_fed:
+                        stmts_list = trust_policy.get("Statement", [])
+                        if isinstance(stmts_list, dict):
+                            stmts_list = [stmts_list]
+                        has_service = False
+                        has_other = False
+                        for s in stmts_list:
+                            if isinstance(s, dict):
+                                p = s.get("Principal", {})
+                                if isinstance(p, dict):
+                                    if "Service" in p:
+                                        has_service = True
+                                    if "AWS" in p or "Federated" in p:
+                                        has_other = True
+                                elif p == "*":
+                                    has_other = True
+                        if has_service and not has_other:
+                            is_pure_service = True
+
+                    if is_pure_service:
+                        sev = Severity.INFO
+                        title_text = "IAM Service Role Missing Permissions Boundary"
+                    elif is_fed:
+                        sev = Severity.MEDIUM
+                        title_text = "IAM Federated Execution Role Missing Permissions Boundary"
+                    else:
+                        sev = Severity.MEDIUM
+                        title_text = "IAM Workload/Application Role Missing Permissions Boundary"
+
                     findings.append(MisconfigurationFinding(
                         id="SEC-IAM-004",
                         title=title_text,
                         category=FindingCategory.CLOUD_IAM,
-                        severity=Severity.MEDIUM,
+                        severity=sev,
                         resource_id=role_name,
                         resource_type="aws_iam_role",
                         layer="IAM",
@@ -358,7 +427,7 @@ class AttackPathAnalyzer:
                         ),
                         remediation_recommendation="Define and attach an explicit IAM permissions_boundary to all workload roles.",
                         compliance_controls=["CIS AWS Benchmark 1.18", "AWS Well-Architected Security Pillar"],
-                        cvss_score=5.8
+                        cvss_score=3.5 if is_pure_service else 5.8
                     ))
 
             # 3. Inspect KMS Cryptographic Keys
@@ -759,8 +828,8 @@ class AttackPathAnalyzer:
                 layer="Cross-Layer",
                 description=(
                     f"Container '{ap.nodes[0]['name']}' accesses AWS IAM via OIDC IRSA and leverages wildcard kms:Decrypt "
-                    f"to decrypt assets in '{ap.nodes[-1]['name']}'. Single-layer scanners like Prowler and AWS Access Analyzer "
-                    "completely miss this threat (100% False-Negative)."
+                    f"to access assets in '{ap.nodes[-1]['name']}'. Single-layer posture scanners and siloed IaC linters "
+                    "completely miss this multi-tier correlation (Multi-Tier Blindspot)."
                 ),
                 remediation_recommendation=(
                     "Enforce scoped Least-Privilege Terraform remediation: Replace wildcard '*' with CMK ARN and enforce "

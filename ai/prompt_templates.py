@@ -19,7 +19,7 @@ Guiding Principles:
    - For 's3_resource_policy': remediate 'aws_s3_bucket_policy', replace Principal '*' with the exact authorized IAM Role ARN (do NOT invent KMS keys or aws_iam_policy), and enforce 'aws:PrincipalArn'.
 2. Copy every provided ARN, resource name, and bucket name VERBATIM from [VERIFIED GRAPH IDENTIFIERS]. Never invent, truncate, or alter UUIDs or IAM role paths.
 3. Eliminate all un-scoped wildcard '*' grants in Resource or Principal.
-4. Provide a clear threat narrative explaining why single-layer scanners (Prowler, Checkov, AWS Access Analyzer, Kubescape) missed this cross-layer path.
+4. Provide a clear threat narrative explaining why single-layer scanners and siloed linters missed this cross-layer path.
 """
 
 
@@ -114,13 +114,19 @@ def _sanitize_tf_ident(name: str, fallback: str) -> str:
 
 
 def detect_attack_path_vector(nodes: list) -> str:
-    """Returns 'iam_policy', 'kms_resource_policy', or 's3_resource_policy' based on path nodes."""
+    """Returns 'iam_policy', 's3_identity_policy', 'kms_resource_policy', or 's3_resource_policy' based on path nodes."""
     types = {str(n.get("type", "")) for n in (nodes or [])}
-    if types & {"IAM_POLICY", "NodeType.IAM_POLICY"}:
+    has_policy = bool(types & {"IAM_POLICY", "NodeType.IAM_POLICY"})
+    has_key = bool(types & {"KMS_KEY", "NodeType.KMS_KEY"})
+    has_bucket = bool(types & {"S3_BUCKET", "NodeType.S3_BUCKET"})
+
+    if has_policy:
+        if has_bucket and not has_key:
+            return "s3_identity_policy"
         return "iam_policy"
-    if types & {"KMS_KEY", "NodeType.KMS_KEY"}:
+    if has_key:
         return "kms_resource_policy"
-    if types & {"S3_BUCKET", "NodeType.S3_BUCKET"}:
+    if has_bucket:
         return "s3_resource_policy"
     return "iam_policy"
 
@@ -279,6 +285,53 @@ resource "aws_s3_bucket_policy" "scoped_{bucket_tf_ident}_policy" {{
     if not clean_policy_res.startswith("scoped_"):
         clean_policy_res = f"scoped_{clean_policy_res}"
 
+    remediated_policy_name = policy_name.replace("Overprivileged", "Scoped")
+    if remediated_policy_name == policy_name and not remediated_policy_name.startswith("Scoped"):
+        remediated_policy_name = f"Scoped{policy_name}"
+
+    role_tf_ident = _sanitize_tf_ident(role_name, "role")
+    role_ref_val = (
+        f'"{role_arn}"'
+        if (use_explicit_arns and role_arn)
+        else (f'"{role_name}"' if use_explicit_arns else f"aws_iam_role.{role_tf_ident}.name")
+    )
+
+    if vector_type == "s3_identity_policy":
+        if use_explicit_arns and bucket_arn:
+            s3_res_list = f'[\n          "{bucket_arn}",\n          "{bucket_arn}/*"\n        ]'
+        elif not use_explicit_arns:
+            s3_res_list = f'[\n          aws_s3_bucket.{bucket_tf_ident}.arn,\n          "${{aws_s3_bucket.{bucket_tf_ident}.arn}}/*"\n        ]'
+        else:
+            s3_res_list = f'[\n          "arn:aws:s3:::{bucket_name}",\n          "arn:aws:s3:::{bucket_name}/*"\n        ]'
+
+        preserved_actions = next(
+            (n.get("allowed_actions") for n in (nodes or []) if n.get("allowed_actions")),
+            None,
+        )
+        s3_actions_json = json.dumps(preserved_actions or ["s3:GetObject"])
+
+        return f"""resource "aws_iam_policy" "{clean_policy_res}" {{
+  name        = "{remediated_policy_name}"
+  description = "Remediated by AI-CSPM: Strictly scoped to authorized S3 storage bucket"
+
+  policy = jsonencode({{
+    Version = "2012-10-17"
+    Statement = [
+      {{
+        Sid    = "ScopedStorageAccessOnly"
+        Effect = "Allow"
+        Action   = {s3_actions_json}
+        Resource = {s3_res_list}
+      }}
+    ]
+  }})
+}}
+
+resource "aws_iam_role_policy_attachment" "{clean_policy_res}_attach" {{
+  role       = {role_ref_val}
+  policy_arn = aws_iam_policy.{clean_policy_res}.arn
+}}"""
+
     if use_explicit_arns:
         if key_arn:
             resource_expr = f'"{key_arn}"'
@@ -289,9 +342,33 @@ resource "aws_s3_bucket_policy" "scoped_{bucket_tf_ident}_policy" {{
     else:
         resource_expr = f"aws_kms_key.{key_tf_ident}.arn"
 
-    remediated_policy_name = policy_name.replace("Overprivileged", "Scoped")
-    if remediated_policy_name == policy_name and not remediated_policy_name.startswith("Scoped"):
-        remediated_policy_name = f"Scoped{policy_name}"
+    if use_explicit_arns and bucket_arn:
+        enc_cond_block = f"""Condition = {{
+          StringLike = {{
+            "kms:EncryptionContext:aws:s3:arn" = [
+              "{bucket_arn}",
+              "{bucket_arn}/*"
+            ]
+          }}
+        }}"""
+    elif not use_explicit_arns:
+        enc_cond_block = f"""Condition = {{
+          StringLike = {{
+            "kms:EncryptionContext:aws:s3:arn" = [
+              aws_s3_bucket.{bucket_tf_ident}.arn,
+              "${{aws_s3_bucket.{bucket_tf_ident}.arn}}/*"
+            ]
+          }}
+        }}"""
+    else:
+        enc_cond_block = f"""Condition = {{
+          StringLike = {{
+            "kms:EncryptionContext:aws:s3:arn" = [
+              "arn:aws:s3:::{bucket_name}",
+              "arn:aws:s3:::{bucket_name}/*"
+            ]
+          }}
+        }}"""
 
     return f"""resource "aws_iam_policy" "{clean_policy_res}" {{
   name        = "{remediated_policy_name}"
@@ -311,14 +388,15 @@ resource "aws_s3_bucket_policy" "scoped_{bucket_tf_ident}_policy" {{
         Resource = {resource_expr}
 
         # REMEDIATED: Cryptographic binding strictly to authorized S3 vault
-        Condition = {{
-          StringEquals = {{
-            "kms:EncryptionContext:aws:s3:arn" = {bucket_expr}
-          }}
-        }}
+        {enc_cond_block}
       }}
     ]
   }})
+}}
+
+resource "aws_iam_role_policy_attachment" "{clean_policy_res}_attach" {{
+  role       = {role_ref_val}
+  policy_arn = aws_iam_policy.{clean_policy_res}.arn
 }}"""
 
 

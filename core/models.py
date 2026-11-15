@@ -5,8 +5,9 @@ Defines semantic graph nodes, edge types, attack path models, and remediation sc
 
 import json
 import urllib.parse
+import fnmatch
 from enum import Enum
-from typing import Dict, List, Optional, Any
+from typing import Dict, List, Optional, Any, Tuple
 from pydantic import BaseModel, Field
 
 
@@ -296,6 +297,55 @@ def statement_targets_kms_key(stmt: PolicyStatement, key_matcher_fn: Any) -> boo
     return False
 
 
+def _act_match(patterns: List[Any], target: str) -> bool:
+    """Matches an action against target using fnmatchcase."""
+    return any(fnmatch.fnmatchcase(target.lower(), str(p).strip().lower()) for p in patterns)
+
+
+def statement_allows_s3_object_read(s: PolicyStatement) -> bool:
+    """Returns True if an IAM statement grants object read access (s3:GetObject). Pure s3:ListBucket is excluded."""
+    if s.effect.strip().lower() != "allow":
+        return False
+    if s.actions:
+        return _act_match(s.actions, "s3:getobject")
+    if s.not_actions:
+        return not _act_match(s.not_actions, "s3:getobject")
+    return False
+
+
+def statement_denies_s3_object_read(s: PolicyStatement) -> bool:
+    """Returns True if an unconditional Deny statement explicitly blocks s3:GetObject."""
+    if s.effect.strip().lower() != "deny":
+        return False
+    if s.conditions:
+        return False
+    if s.actions:
+        return _act_match(s.actions, "s3:getobject")
+    if s.not_actions:
+        return not _act_match(s.not_actions, "s3:getobject")
+    return False
+
+
+def s3_resource_hits_bucket(res: Any, bucket_name: str) -> Tuple[bool, bool]:
+    """
+    Evaluates whether an S3 resource expression hits a target bucket.
+    Returns (hits_bucket, is_wildcard_or_all_objects).
+    """
+    r = str(res).strip()
+    if r == "*":
+        return True, True
+    if not r.startswith("arn:aws:s3:::"):
+        # Plain bucket name fallback or non-ARN
+        clean_r = r.rstrip("/*")
+        if clean_r == bucket_name:
+            return True, ("/*" in r or r.endswith("*"))
+        return False, False
+    target = r[len("arn:aws:s3:::"):].rstrip("/*")
+    if target == bucket_name:
+        return True, ("/*" in r or r.endswith("*"))
+    return False, False
+
+
 class BaseNode(BaseModel):
     id: str
     name: str
@@ -361,6 +411,8 @@ class AttackPath(BaseModel):
     steps: List[str]
     root_cause: str
     impact: str
+    affected_workloads: List[str] = Field(default_factory=list)
+    exposed_assets: List[str] = Field(default_factory=list)
     false_negative_tools: List[str] = Field(
         default_factory=lambda: [
             "Single-layer IAM policy scanners (lack K8s OIDC correlation)",

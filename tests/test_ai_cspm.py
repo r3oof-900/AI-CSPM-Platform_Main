@@ -793,7 +793,7 @@ spec:
     )
     rc = run_scan(target_dir=str(tmp_path), offline_mode=True, format_type="json")
     out_json = json.loads(capsys.readouterr().out)
-    assert rc in (0, 1)
+    assert rc in (0, 1, 2)
     assert len(out_json["parse_warnings"]) >= 1
     f_ids = {f["id"] for f in out_json["misconfigurations"]}
     assert "SEC-KMS-002" in f_ids
@@ -2589,21 +2589,21 @@ def test_production_readiness_audit_fixes(tmp_path, capsys):
     from ai.engine import AIRemediationEngine
     import ai_cspm
 
-    # 1. Empty directory should produce SEC-PARSE-002 and fail on medium/low
+    # 1. Empty directory should produce SEC-PARSE-002 and fail with exit code 2 (scan error)
     empty_dir = tmp_path / "empty_dir"
     empty_dir.mkdir()
     rc_empty = ai_cspm.run_scan(target_dir=str(empty_dir), offline_mode=True, format_type="json", fail_on="medium")
-    assert rc_empty == 1
+    assert rc_empty == 2
     empty_json = json.loads(capsys.readouterr().out)
     empty_f_ids = {f["id"] for f in empty_json["misconfigurations"]}
     assert "SEC-PARSE-002" in empty_f_ids
 
-    # 2. Corrupt/broken manifest should produce SEC-PARSE-001 and fail on high
+    # 2. Corrupt/broken manifest should produce SEC-PARSE-001 and fail with exit code 2 (scan error)
     broken_dir = tmp_path / "broken_manifest_dir"
     broken_dir.mkdir()
     (broken_dir / "bad.tf").write_text("resource aws_kms_key bad { this is not valid HCL !!! }", encoding="utf-8")
     rc_broken = ai_cspm.run_scan(target_dir=str(broken_dir), offline_mode=True, format_type="json", fail_on="high")
-    assert rc_broken == 1
+    assert rc_broken == 2
     broken_json = json.loads(capsys.readouterr().out)
     broken_f_ids = {f["id"] for f in broken_json["misconfigurations"]}
     assert "SEC-PARSE-001" in broken_f_ids
@@ -2731,6 +2731,220 @@ resource "aws_iam_policy" "api_worker" {
     orig_code = ai_eng._read_original_policy_code(ap_sec)
     assert "super_secret_production_password_123" not in orig_code
     assert "[REDACTED_BY_AI_CSPM]" in orig_code
+
+
+def test_live_ids_do_not_collide():
+    cg = ContextualGraph()
+    # 1. Deployment and StatefulSet with same name in same namespace must not collide
+    w1 = WorkloadNode(id="k8s:workload:prod:deployment:payment-api", name="payment-api", namespace="prod", service_account="sa1", properties={"kind": "Deployment"})
+    w2 = WorkloadNode(id="k8s:workload:prod:statefulset:payment-api", name="payment-api", namespace="prod", service_account="sa2", properties={"kind": "StatefulSet"})
+    cg.add_node(w1)
+    cg.add_node(w2)
+    assert cg.graph.has_node("k8s:workload:prod:deployment:payment-api")
+    assert cg.graph.has_node("k8s:workload:prod:statefulset:payment-api")
+    assert len(cg.graph.nodes()) == 2
+
+    # 2. Policies with same name in different accounts/ARNs must not collide
+    p1 = IAMPolicyNode(id="aws:iam:policy:arn:aws:iam::111:policy/ReadOnly", name="ReadOnly", policy_arn="arn:aws:iam::111:policy/ReadOnly")
+    p2 = IAMPolicyNode(id="aws:iam:policy:arn:aws:iam::222:policy/ReadOnly", name="ReadOnly", policy_arn="arn:aws:iam::222:policy/ReadOnly")
+    cg.add_node(p1)
+    cg.add_node(p2)
+    assert cg.graph.has_node("aws:iam:policy:arn:aws:iam::111:policy/ReadOnly")
+    assert cg.graph.has_node("aws:iam:policy:arn:aws:iam::222:policy/ReadOnly")
+    assert len(cg.warnings) == 0
+
+
+def test_s3_deny_blocks_path():
+    cg = ContextualGraph()
+    w = WorkloadNode(id="k8s:workload:prod:app", name="app", namespace="prod", service_account="sa")
+    sa = ServiceAccountNode(id="k8s:sa:prod:sa", name="sa", namespace="prod", role_arn="arn:aws:iam::123:role/app-role")
+    r = IAMRoleNode(id="iam:role:app-role", name="app-role", role_arn="arn:aws:iam::123:role/app-role")
+    # Allow policy
+    p_allow = IAMPolicyNode(
+        id="iam:policy:allow-s3",
+        name="allow-s3",
+        statements=[PolicyStatement(effect="Allow", actions=["s3:*"], resources=["*"])]
+    )
+    # Explicit Deny policy on the role
+    p_deny = IAMPolicyNode(
+        id="iam:policy:deny-s3",
+        name="deny-s3",
+        statements=[PolicyStatement(effect="Deny", actions=["s3:GetObject"], resources=["*"])]
+    )
+    b = S3BucketNode(id="s3:bucket:secret-vault", name="secret-vault", bucket_name="secret-vault", bucket_arn="arn:aws:s3:::secret-vault")
+
+    cg.build_from_parsed(
+        workloads=[w],
+        service_accounts=[sa],
+        roles=[r],
+        policies=[p_allow, p_deny],
+        kms_keys=[],
+        s3_buckets=[b],
+        attachments=[{"role": "app-role", "policy": "allow-s3"}, {"role": "app-role", "policy": "deny-s3"}]
+    )
+
+    analyzer = AttackPathAnalyzer(cg)
+    paths = analyzer.find_cross_layer_attack_paths()
+    # Explicit unconditional Deny on s3:GetObject must block the direct storage attack path!
+    assert len(paths) == 0
+
+
+def test_listbucket_not_exfil():
+    cg = ContextualGraph()
+    w = WorkloadNode(id="k8s:workload:prod:reader", name="reader", namespace="prod", service_account="sa")
+    sa = ServiceAccountNode(id="k8s:sa:prod:sa", name="sa", namespace="prod", role_arn="arn:aws:iam::123:role/reader-role")
+    r = IAMRoleNode(id="iam:role:reader-role", name="reader-role", role_arn="arn:aws:iam::123:role/reader-role")
+    # Policy with ONLY s3:ListBucket (reconnaissance, not object exfiltration)
+    p_list = IAMPolicyNode(
+        id="iam:policy:list-only",
+        name="list-only",
+        statements=[PolicyStatement(effect="Allow", actions=["s3:ListBucket"], resources=["*"])]
+    )
+    b = S3BucketNode(id="s3:bucket:customer-data", name="customer-data", bucket_name="customer-data", bucket_arn="arn:aws:s3:::customer-data")
+
+    cg.build_from_parsed(
+        workloads=[w],
+        service_accounts=[sa],
+        roles=[r],
+        policies=[p_list],
+        kms_keys=[],
+        s3_buckets=[b],
+        attachments=[{"role": "reader-role", "policy": "list-only"}]
+    )
+
+    analyzer = AttackPathAnalyzer(cg)
+    paths = analyzer.find_cross_layer_attack_paths()
+    # Pure ListBucket without GetObject must NOT produce a critical data exfiltration attack path!
+    assert len(paths) == 0
+
+
+def test_s3_only_remediation_is_valid():
+    from ai.prompt_templates import build_scoped_kms_policy_hcl, detect_attack_path_vector
+    nodes = [
+        {"id": "w", "name": "web-pod", "type": "WORKLOAD", "layer": "Kubernetes"},
+        {"id": "sa", "name": "web-sa", "type": "SERVICE_ACCOUNT", "layer": "Kubernetes"},
+        {"id": "r", "name": "web-role", "type": "IAM_ROLE", "layer": "IAM", "role_arn": "arn:aws:iam::123456789012:role/web-role"},
+        {"id": "p", "name": "OverprivilegedS3Policy", "type": "IAM_POLICY", "layer": "IAM"},
+        {"id": "b", "name": "app-vault", "type": "S3_BUCKET", "layer": "Storage", "bucket_arn": "arn:aws:s3:::app-vault", "bucket_name": "app-vault"},
+    ]
+    vector = detect_attack_path_vector(nodes)
+    assert vector == "s3_identity_policy"
+
+    hcl = build_scoped_kms_policy_hcl(nodes)
+    # Must NOT mention KMS or EncryptionContext
+    assert "aws_kms_key" not in hcl
+    assert "kms:Decrypt" not in hcl
+    assert "kms:EncryptionContext" not in hcl
+    assert "payment_key" not in hcl
+    # Must scope S3 and create attachment
+    assert 'resource "aws_iam_policy"' in hcl
+    assert ("aws_s3_bucket.app_vault.arn" in hcl or "arn:aws:s3:::app-vault" in hcl)
+    assert 'resource "aws_iam_role_policy_attachment"' in hcl
+    assert "aws_iam_policy." in hcl
+
+
+def test_grouped_paths_scale():
+    cg = ContextualGraph()
+    # 5 workloads sharing one IAM role with broad S3 grant to 4 buckets
+    workloads = [
+        WorkloadNode(id=f"k8s:workload:prod:microservice-{i}", name=f"microservice-{i}", namespace="prod", service_account="shared-sa")
+        for i in range(5)
+    ]
+    sa = ServiceAccountNode(id="k8s:sa:prod:shared-sa", name="shared-sa", namespace="prod", role_arn="arn:aws:iam::123:role/shared-role")
+    r = IAMRoleNode(id="iam:role:shared-role", name="shared-role", role_arn="arn:aws:iam::123:role/shared-role")
+    p = IAMPolicyNode(
+        id="iam:policy:wide-s3",
+        name="wide-s3",
+        statements=[PolicyStatement(effect="Allow", actions=["s3:GetObject"], resources=["*"])]
+    )
+    buckets = [
+        S3BucketNode(id=f"s3:bucket:vault-{j}", name=f"vault-{j}", bucket_name=f"vault-{j}", bucket_arn=f"arn:aws:s3:::vault-{j}")
+        for j in range(4)
+    ]
+
+    cg.build_from_parsed(
+        workloads=workloads,
+        service_accounts=[sa],
+        roles=[r],
+        policies=[p],
+        kms_keys=[],
+        s3_buckets=buckets,
+        attachments=[{"role": "shared-role", "policy": "wide-s3"}]
+    )
+
+    analyzer = AttackPathAnalyzer(cg)
+    paths = analyzer.find_cross_layer_attack_paths()
+    # Grouping consolidates 5x4=20 combinatorial paths into 1 unified attack path!
+    assert len(paths) == 1
+    assert len(paths[0].affected_workloads) == 5
+    assert len(paths[0].exposed_assets) == 4
+    assert "5 Workloads -> 4 Assets" in paths[0].title
+
+
+def test_ci_exit_2_on_empty_or_bad_iac(tmp_path):
+    import ai_cspm
+
+    # 1. Empty target returns 2 (scan failed)
+    empty_d = tmp_path / "empty_target_ci"
+    empty_d.mkdir()
+    rc_empty = ai_cspm.run_scan(target_dir=str(empty_d), offline_mode=True, format_type="json")
+    assert rc_empty == 2
+
+    # 2. Empty target with allow_empty=True passes
+    rc_allow = ai_cspm.run_scan(target_dir=str(empty_d), offline_mode=True, format_type="json", allow_empty=True)
+    assert rc_allow == 0
+
+    # 3. Bad syntax returns 2 (scan failed)
+    bad_d = tmp_path / "bad_syntax_ci"
+    bad_d.mkdir()
+    (bad_d / "corrupt.tf").write_text("invalid syntax !!! { }", encoding="utf-8")
+    rc_bad = ai_cspm.run_scan(target_dir=str(bad_d), offline_mode=True, format_type="json")
+    assert rc_bad == 2
+
+
+def test_privacy_targeted_hcl_and_secrets_redacted(tmp_path):
+    ai_eng = AIRemediationEngine(offline_mode=True)
+    tf_file = tmp_path / "app_bundle.tf"
+    tf_file.write_text("""
+# Sensitive database config in the same file
+resource "aws_db_instance" "prod_db" {
+  password = "SuperSecretDatabasePassword999!"
+  username = "admin"
+}
+
+# The target IAM policy
+resource "aws_iam_policy" "target_flawed_policy" {
+  name = "target_flawed_policy"
+  description = "Bearer eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.e30.fake_token_value_abc_123"
+  policy = jsonencode({
+    Version = "2012-10-17"
+    Statement = [{
+      Effect = "Allow"
+      Action = "kms:Decrypt"
+      Resource = "*"
+    }]
+  })
+}
+""", encoding="utf-8")
+
+    from core.models import AttackPath
+    ap = AttackPath(
+        id="AP-PRIV",
+        title="Privacy Isolation Test",
+        nodes=[{"type": "IAM_POLICY", "name": "target_flawed_policy", "source_file": str(tf_file)}],
+        steps=["s1"],
+        root_cause="rc",
+        impact="imp"
+    )
+
+    code = ai_eng._read_original_policy_code(ap)
+    # Must only extract the target block, NOT the db instance
+    assert "aws_db_instance" not in code
+    assert "SuperSecretDatabasePassword999!" not in code
+    # Secrets in the target block must be redacted
+    assert "fake_token_value_abc_123" not in code
+    assert "[REDACTED_BY_AI_CSPM]" in code
+
 
 
 

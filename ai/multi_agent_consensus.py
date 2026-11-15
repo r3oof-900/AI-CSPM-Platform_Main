@@ -439,7 +439,7 @@ Return ONLY a valid JSON object matching this schema:
                     "Step 2: Read projected OIDC ServiceAccount token bound to IRSA.",
                     f"Step 3: Call sts:AssumeRoleWithWebIdentity to obtain temporary AWS credentials for '{role}'.",
                     step4_en,
-                    "Step 5: Full data exfiltration without triggering single-layer IAM alarms (Prowler PASS)."
+                    "Step 5: Full data exfiltration without triggering single-layer IAM alarms (missed by isolated scanners)."
                 ]
             },
             "blue_team": {

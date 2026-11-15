@@ -59,6 +59,7 @@ class TerraformParser:
         self.kms_key_policies: Dict[str, List[PolicyStatement]] = {}
         self.kms_aliases: Dict[str, str] = {}
         self.policy_documents: Dict[str, Dict[str, Any]] = {}
+        self.parse_errors: List[str] = []
         self.parse_warnings: List[str] = []
 
     def _resolve_value(self, value: Any) -> Any:
@@ -206,7 +207,7 @@ class TerraformParser:
                         self.account_id = str(val)
                     elif v_name in ["aws_region", "region"]:
                         self.region = str(val)
-                    elif isinstance(val, str) and re.match(r"^\d{12}$", val.strip()):
+                    elif any(term in v_name.lower() for term in ("account", "acct")) and isinstance(val, str) and re.match(r"^\d{12}$", val.strip()):
                         self.account_id = val.strip()
         except Exception as exc:
             self.parse_warnings.append(f"Error reading tfvars {filepath}: {exc}")
@@ -246,6 +247,19 @@ class TerraformParser:
             bpol = next((self.s3_bucket_policies[k] for k in keys_to_check if k in self.s3_bucket_policies), None)
             if bpol:
                 b.properties["bucket_policy_statements"] = [s.model_dump() for s in bpol]
+
+        # Infer account ID from discovered ARNs if still on default
+        if self.account_id == "123456789012":
+            all_arns = [r.role_arn for r in self.roles] + [p.policy_arn for p in self.policies if p.policy_arn] + [k.key_arn for k in self.kms_keys]
+            for arn in all_arns:
+                if arn and arn.startswith("arn:"):
+                    parts = arn.split(":")
+                    if len(parts) >= 5 and parts[4].isdigit() and len(parts[4]) == 12 and parts[4] != "123456789012":
+                        self.account_id = parts[4]
+                        break
+
+        if self.account_id == "123456789012" and (self.roles or self.policies or self.kms_keys or self.s3_buckets):
+            self.parse_warnings.append("Using default simulated AWS Account ID '123456789012'; specify aws_account_id in tfvars for exact ARN synthesis.")
 
     @staticmethod
     def _unwrap_hcl_val(val: Any, default: Any = None) -> Any:
@@ -297,7 +311,7 @@ class TerraformParser:
                         self.account_id = str(val)
                     elif v_name in ["aws_region", "region"]:
                         self.region = str(val)
-                    elif isinstance(val, str) and re.match(r"^\d{12}$", val.strip()):
+                    elif any(term in v_name.lower() for term in ("account", "acct")) and isinstance(val, str) and re.match(r"^\d{12}$", val.strip()):
                         self.account_id = val.strip()
 
         # Locals
@@ -407,7 +421,7 @@ class TerraformParser:
             )
             self.policies.append(node)
         except Exception as e:
-            self.parse_warnings.append(f"Error parsing standalone JSON policy {filepath}: {e}")
+            self.parse_errors.append(f"Error parsing standalone JSON policy {filepath}: {e}")
 
     def _parse_statements(self, stmts_data: Any) -> List[PolicyStatement]:
         """Normalizes IAM policy statements."""
@@ -419,7 +433,7 @@ class TerraformParser:
             with open(filepath, "r", encoding="utf-8") as f:
                 obj = hcl2.load(f)
         except Exception as e:
-            self.parse_warnings.append(f"Error reading HCL2 file {filepath}: {e}")
+            self.parse_errors.append(f"Error reading HCL2 file {filepath}: {e}")
             return
 
         if "module" in obj:

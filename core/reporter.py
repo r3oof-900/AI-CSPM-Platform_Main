@@ -174,7 +174,7 @@ def _inject_condition_after_resource(block_text: str, cond_key: str, hcl_val_exp
     res_pat = (
         r'("Resource"\s*:\s*(?:\[[\s\S]*?\]|"[^"\n]*"))'
         if is_json_style
-        else r'(Resource\s*=\s*(?:\[[\s\S]*?\]|[^\n]+))'
+        else r'(Resource\s*=\s*(?:\[[\s\S]*?\]|"(?:[^"\\]|\\.)*"|[^\n,}]+))'
     )
     if re.search(r'"Condition"\s*:\s*\{', slice_txt):
         return block_text[:search_from] + _merge_json_text_condition(slice_txt, cond_key, json_val_str)
@@ -195,11 +195,21 @@ def _inject_condition_after_resource(block_text: str, cond_key: str, hcl_val_exp
             )
             slice_txt = slice_txt[:r_end] + cond_snippet + slice_txt[r_end:]
         return block_text[:search_from] + slice_txt
-    cond_hcl = (
-        f'\\1\n        Condition = {{\n          StringEquals = {{\n'
-        f'            "{cond_key}" = {hcl_val_expr}\n          }}\n        }}'
-    )
-    return block_text[:search_from] + re.sub(res_pat, cond_hcl, slice_txt, count=1)
+    res_m = re.search(res_pat, slice_txt)
+    if res_m:
+        r_end = res_m.end()
+        after = slice_txt[r_end:]
+        cond_hcl = (
+            f'\n        Condition = {{\n          StringEquals = {{\n'
+            f'            "{cond_key}" = {hcl_val_expr}\n          }}\n        }}'
+        )
+        if after.lstrip().startswith("}"):
+            brace_offset = r_end + (len(after) - len(after.lstrip()))
+            slice_txt = slice_txt[:brace_offset] + cond_hcl + "\n      " + slice_txt[brace_offset:]
+        else:
+            slice_txt = slice_txt[:r_end] + cond_hcl + slice_txt[r_end:]
+        return block_text[:search_from] + slice_txt
+    return block_text
 
 
 def _merge_json_condition(stmt: Dict[str, Any], cond_key: str, cond_val: str):

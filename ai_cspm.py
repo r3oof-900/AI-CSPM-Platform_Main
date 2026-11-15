@@ -109,11 +109,14 @@ def run_scan(
     k8s_endpoint: Optional[str] = None,
     k8s_token: Optional[str] = None,
     k8s_ca_cert: Optional[str] = None,
-    k8s_insecure: bool = False
+    k8s_insecure: bool = False,
+    strict: bool = False,
+    allow_empty: bool = False
 ) -> int:
     cg = ContextualGraph()
     source_description = ""
     parse_warnings = []
+    parse_errors = []
     is_aicspm_snapshot = False
     loaded_snapshot_data = None
     aws_json = None
@@ -290,6 +293,13 @@ def run_scan(
             analyzer = AttackPathAnalyzer(cg, tf_parser=tf, k8s_parser=k8s)
             parse_warnings.extend(getattr(tf, "parse_warnings", []))
             parse_warnings.extend(getattr(aws_json, "parse_warnings", []))
+            parse_warnings.extend(getattr(k8s, "parse_warnings", []))
+            parse_errors.extend(getattr(tf, "parse_errors", []))
+            parse_errors.extend(getattr(aws_json, "parse_errors", []))
+            parse_errors.extend(getattr(k8s, "parse_errors", []))
+            parse_errors.extend(getattr(cg, "parse_errors", []))
+            collision_warnings = [w for w in getattr(cg, "warnings", []) if "ID collision" in w]
+            parse_errors.extend(collision_warnings)
 
     if format_type == "console" and parse_warnings:
         for pw in parse_warnings:
@@ -349,7 +359,7 @@ def run_scan(
         misconfigs = analyzer.audit_all_misconfigurations(attack_paths=attack_paths)
 
         # Evaluate Parsing Integrity & Asset Discovery
-        has_parse_errors = any("Error reading" in w or "Error parsing" in w or "syntax error" in w.lower() for w in parse_warnings)
+        has_parse_errors = bool(parse_errors) or any("Error reading" in w or "Error parsing" in w or "syntax error" in w.lower() for w in parse_warnings)
         if has_parse_errors:
             misconfigs.append(MisconfigurationFinding(
                 id="SEC-PARSE-001",
@@ -678,13 +688,22 @@ def run_scan(
     if apply_fix and remediations:
         if live_mode or live_demo:
             patch_file = os.path.join(os.getcwd(), "remediated_live_least_privilege.tf")
-            seen_blocks = set()
+            seen_res_keys = set()
             unique_blocks = []
             for r in remediations:
                 code_strip = (r.remediated_code or "").strip()
-                if code_strip and code_strip not in seen_blocks:
-                    seen_blocks.add(code_strip)
-                    unique_blocks.append(code_strip)
+                if not code_strip:
+                    continue
+                blocks = re.split(r'\n(?=resource\s+")', code_strip)
+                for blk in blocks:
+                    blk_clean = blk.strip()
+                    if not blk_clean:
+                        continue
+                    m = re.match(r'resource\s+"([^"]+)"\s+"([^"]+)"', blk_clean)
+                    res_key = (m.group(1), m.group(2)) if m else blk_clean
+                    if res_key not in seen_res_keys:
+                        seen_res_keys.add(res_key)
+                        unique_blocks.append(blk_clean)
             with open(patch_file, "w", encoding="utf-8") as f:
                 f.write("\n\n".join(unique_blocks))
             if format_type == "console":
@@ -752,7 +771,13 @@ def run_scan(
         "medium": bool(attack_paths or severity_counts["CRITICAL"] > 0 or severity_counts["HIGH"] > 0 or severity_counts["MEDIUM"] > 0),
         "low": bool(attack_paths or len(misconfigs) > 0),
     }
-    return 1 if fail_thresholds.get(fail_on, fail_thresholds["critical"]) else 0
+
+    scan_failed = (
+        (bool(parse_errors) or (strict and bool(parse_warnings)) or (len(cg.graph.nodes()) == 0 and not is_aicspm_snapshot and bool(target_dir)))
+        and not allow_empty
+    )
+    threshold_exit_code = 1 if fail_thresholds.get(fail_on, fail_thresholds["critical"]) else 0
+    return 2 if scan_failed else threshold_exit_code
 
 
 def main():
@@ -871,6 +896,16 @@ Examples:
         help="Minimum finding threshold that triggers non-zero exit code 1 (default: critical)"
     )
     parser.add_argument(
+        "--strict",
+        action="store_true",
+        help="Strict mode: exit with code 2 if any parser warnings are encountered (e.g. unexpanded modules/for_each)"
+    )
+    parser.add_argument(
+        "--allow-empty",
+        action="store_true",
+        help="Allow empty scan target without exiting with error code 2"
+    )
+    parser.add_argument(
         "--version",
         "-v",
         action="version",
@@ -903,7 +938,9 @@ Examples:
         k8s_endpoint=args.k8s_endpoint,
         k8s_token=args.k8s_token,
         k8s_ca_cert=args.k8s_ca_cert,
-        k8s_insecure=args.k8s_insecure
+        k8s_insecure=args.k8s_insecure,
+        strict=args.strict,
+        allow_empty=args.allow_empty
     )
     sys.exit(exit_code)
 
