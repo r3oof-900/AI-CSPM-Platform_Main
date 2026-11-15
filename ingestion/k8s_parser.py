@@ -65,10 +65,11 @@ class K8sParser:
                 }
 
             elif kind in ["RoleBinding", "ClusterRoleBinding"]:
+                rb_ns = "" if kind == "ClusterRoleBinding" else namespace
                 self.role_bindings.append({
                     "kind": kind,
                     "name": name,
-                    "namespace": namespace,
+                    "namespace": rb_ns,
                     "roleRef": doc.get("roleRef") or {},
                     "subjects": doc.get("subjects") or [],
                     "source_file": filepath
@@ -113,8 +114,17 @@ class K8sParser:
                 primary_container = containers[0] if containers else {}
                 automount = template_spec.get("automountServiceAccountToken", None)
 
+                base_w_id = f"k8s:workload:{namespace}:{name}"
+                existing_w_ids = {w.id for w in self.workloads} | {w.id for w in file_workloads}
+                if base_w_id in existing_w_ids:
+                    w_id = f"k8s:workload:{kind.lower()}:{namespace}:{name}"
+                    if w_id in existing_w_ids:
+                        w_id = f"k8s:workload:{kind.lower()}:{namespace}:{name}:{len(existing_w_ids)}"
+                else:
+                    w_id = base_w_id
+
                 workload_node = WorkloadNode(
-                    id=f"k8s:workload:{namespace}:{name}",
+                    id=w_id,
                     name=name,
                     namespace=namespace,
                     service_account=sa_name,

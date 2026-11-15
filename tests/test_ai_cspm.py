@@ -2579,4 +2579,158 @@ def test_native_aicspm_snapshot_file_ingestion(tmp_path, capsys):
     assert graph_out.exists() and graph_out.stat().st_size > 500
 
 
+def test_production_readiness_audit_fixes(tmp_path, capsys):
+    """Verifies all enterprise audit fixes: empty folder/corrupt manifest handling, collision protection, OIDC, count, and secrets sanitization."""
+    from ingestion.k8s_parser import K8sParser
+    from ingestion.tf_parser import TerraformParser
+    from core.graph import ContextualGraph
+    from core.analyzer import AttackPathAnalyzer
+    from core.models import IAMRoleNode, ServiceAccountNode, WorkloadNode, S3BucketNode
+    from ai.engine import AIRemediationEngine
+    import ai_cspm
+
+    # 1. Empty directory should produce SEC-PARSE-002 and fail on medium/low
+    empty_dir = tmp_path / "empty_dir"
+    empty_dir.mkdir()
+    rc_empty = ai_cspm.run_scan(target_dir=str(empty_dir), offline_mode=True, format_type="json", fail_on="medium")
+    assert rc_empty == 1
+    empty_json = json.loads(capsys.readouterr().out)
+    empty_f_ids = {f["id"] for f in empty_json["misconfigurations"]}
+    assert "SEC-PARSE-002" in empty_f_ids
+
+    # 2. Corrupt/broken manifest should produce SEC-PARSE-001 and fail on high
+    broken_dir = tmp_path / "broken_manifest_dir"
+    broken_dir.mkdir()
+    (broken_dir / "bad.tf").write_text("resource aws_kms_key bad { this is not valid HCL !!! }", encoding="utf-8")
+    rc_broken = ai_cspm.run_scan(target_dir=str(broken_dir), offline_mode=True, format_type="json", fail_on="high")
+    assert rc_broken == 1
+    broken_json = json.loads(capsys.readouterr().out)
+    broken_f_ids = {f["id"] for f in broken_json["misconfigurations"]}
+    assert "SEC-PARSE-001" in broken_f_ids
+
+    # 3. K8s Workload Collision: Deployment and StatefulSet with same name in same namespace must NOT overwrite each other
+    collision_yaml = tmp_path / "collision.yaml"
+    collision_yaml.write_text("""
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: microservice
+  namespace: prod
+spec:
+  template:
+    spec:
+      serviceAccountName: sa1
+      containers:
+        - name: app
+          image: app:v1
+---
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: microservice
+  namespace: prod
+spec:
+  template:
+    spec:
+      serviceAccountName: sa2
+      containers:
+        - name: app
+          image: app:v2
+""", encoding="utf-8")
+    k_parser = K8sParser()
+    k_parser.parse_file(str(collision_yaml))
+    assert len(k_parser.workloads) == 2
+    w_ids = {w.id for w in k_parser.workloads}
+    assert len(w_ids) == 2  # No ID collision, both preserved
+
+    # 4. OIDC trust with wildcard sub `system:serviceaccount:*:*` flags SEC-IAM-002
+    cg = ContextualGraph()
+    wild_role = IAMRoleNode(
+        id="iam:role:wild_oidc",
+        name="wild_oidc",
+        role_arn="arn:aws:iam::123456789012:role/wild_oidc",
+        trust_policy={
+            "Statement": [{
+                "Effect": "Allow",
+                "Principal": {"Federated": "arn:aws:iam::123456789012:oidc-provider/oidc.eks.us-east-1.amazonaws.com/id/X"},
+                "Action": "sts:AssumeRoleWithWebIdentity",
+                "Condition": {"StringLike": {"oidc.eks.us-east-1.amazonaws.com/id/X:sub": "system:serviceaccount:*:*"}}
+            }]
+        }
+    )
+    cg.build_from_parsed([], [], [wild_role], [], [], [], [])
+    analyzer = AttackPathAnalyzer(cg)
+    findings = analyzer.audit_all_misconfigurations(attack_paths=[])
+    f_map = {f.id: f for f in findings}
+    assert "SEC-IAM-002" in f_map
+    assert "wildcard sub claim" in f_map["SEC-IAM-002"].description
+
+    # 5. OIDC trust with missing :sub condition still connects SA in graph
+    cg_nosub = ContextualGraph()
+    sa_node = ServiceAccountNode(id="k8s:sa:prod:my-sa", name="my-sa", namespace="prod")
+    nosub_role = IAMRoleNode(
+        id="iam:role:nosub_oidc",
+        name="nosub_oidc",
+        role_arn="arn:aws:iam::123456789012:role/nosub_oidc",
+        trust_policy={
+            "Statement": [{
+                "Effect": "Allow",
+                "Principal": {"Federated": "arn:aws:iam::123456789012:oidc-provider/oidc.eks.us-east-1.amazonaws.com/id/X"},
+                "Action": "sts:AssumeRoleWithWebIdentity"
+            }]
+        }
+    )
+    cg_nosub.build_from_parsed([], [sa_node], [nosub_role], [], [], [], [])
+    assert cg_nosub.graph.has_edge(sa_node.id, nosub_role.id)
+
+    # 6. Terraform count = 2 expands to 2 S3 buckets
+    count_tf = tmp_path / "count.tf"
+    count_tf.write_text("""
+resource "aws_s3_bucket" "multi_vault" {
+  count  = 2
+  bucket = "enterprise-vault"
+}
+module "my_vpc" {
+  source = "./modules/vpc"
+}
+""", encoding="utf-8")
+    tf_p = TerraformParser()
+    tf_p.parse_directory(str(count_tf))
+    assert len(tf_p.s3_buckets) == 2
+    b_names = {b.bucket_name for b in tf_p.s3_buckets}
+    assert "enterprise-vault-0" in b_names
+    assert "enterprise-vault-1" in b_names
+    assert any("module block detected" in w for w in tf_p.parse_warnings)
+
+    # 7. Privacy: Secrets sanitization in AIRemediationEngine
+    ai_eng = AIRemediationEngine(offline_mode=True)
+    sec_file = tmp_path / "secrets_policy.tf"
+    sec_file.write_text("""
+resource "aws_iam_policy" "api_worker" {
+  name        = "api_worker"
+  description = "Worker using secret_key = super_secret_production_password_123"
+  policy = jsonencode({
+    Version = "2012-10-17"
+    Statement = [{
+      Effect = "Allow"
+      Action = "kms:Decrypt"
+      Resource = "*"
+    }]
+  })
+}
+""", encoding="utf-8")
+    from core.models import AttackPath
+    ap_sec = AttackPath(
+        id="AP-SEC",
+        title="Secret Test",
+        nodes=[{"type": "IAM_POLICY", "name": "api_worker", "source_file": str(sec_file)}],
+        steps=["1"],
+        root_cause="rc",
+        impact="imp"
+    )
+    orig_code = ai_eng._read_original_policy_code(ap_sec)
+    assert "super_secret_production_password_123" not in orig_code
+    assert "[REDACTED_BY_AI_CSPM]" in orig_code
+
+
 

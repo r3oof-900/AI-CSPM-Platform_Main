@@ -34,6 +34,7 @@ class EdgeType(_ValueStrEnum):
     ALLOWS_DECRYPT = "ALLOWS_DECRYPT"         # IAM Policy / Resource Policy grants Decrypt on KMS Key
     ENCRYPTS_BUCKET = "ENCRYPTS_BUCKET"       # KMS Key encrypts S3 Bucket
     RESOURCE_POLICY_ALLOWS = "RESOURCE_POLICY_ALLOWS"  # Direct Resource Policy access (KMS/S3)
+    ALLOWS_STORAGE_ACCESS = "ALLOWS_STORAGE_ACCESS"    # Direct IAM policy grants storage access on S3 Bucket
 
 
 class Severity(_ValueStrEnum):
@@ -361,7 +362,11 @@ class AttackPath(BaseModel):
     root_cause: str
     impact: str
     false_negative_tools: List[str] = Field(
-        default_factory=lambda: ["Prowler v5.46", "ScoutSuite", "AWS Access Analyzer", "Checkov", "Trivy"]
+        default_factory=lambda: [
+            "Single-layer IAM policy scanners (lack K8s OIDC correlation)",
+            "Standard K8s linters (halt at cluster boundary)",
+            "Siloed IaC analyzers (miss cross-resource DAG)"
+        ]
     )
 
 

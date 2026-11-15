@@ -5,6 +5,7 @@ Supports live Google Gemini LLM API execution or built-in deterministic contextu
 """
 
 import os
+import re
 import json
 from typing import Optional
 try:
@@ -78,6 +79,19 @@ class AIRemediationEngine:
                 if not source_file and sf:
                     source_file = sf
 
+        def _sanitize_for_llm(text: str) -> str:
+            """Masks secrets, passwords, access keys, and tokens from code before passing to external LLM."""
+            sanitized_lines = []
+            for line in text.splitlines():
+                lower_l = line.lower()
+                if any(sec in lower_l for sec in ("password", "secret_key", "access_token", "private_key", "apikey", "api_key", "secret_access_key")):
+                    if "=" in line or ":" in line:
+                        parts = re.split(r"(=|:)", line, maxsplit=1)
+                        sanitized_lines.append(f"{parts[0]}{parts[1]} \"[REDACTED_BY_AI_CSPM]\"")
+                        continue
+                sanitized_lines.append(line)
+            return "\n".join(sanitized_lines)
+
         if source_file and os.path.exists(source_file) and source_file.endswith((".tf", ".json")):
             try:
                 with open(source_file, "r", encoding="utf-8") as f:
@@ -85,7 +99,7 @@ class AIRemediationEngine:
                 if source_file.endswith(".json"):
                     parsed_sf = json.loads(content)
                     if isinstance(parsed_sf, dict) and "Statement" in parsed_sf:
-                        return content
+                        return _sanitize_for_llm(content)
                 else:
                     expected_kw = (
                         "aws_s3_bucket_policy"
@@ -101,17 +115,17 @@ class AIRemediationEngine:
                                     with open(cand, "r", encoding="utf-8") as cf:
                                         c_txt = cf.read()
                                     if expected_kw in c_txt:
-                                        return c_txt
+                                        return _sanitize_for_llm(c_txt)
                                 except Exception:
                                     pass
-                    return content
+                    return _sanitize_for_llm(content)
             except Exception:
                 pass
 
         if fallback_source and fallback_source.endswith(".tf"):
             try:
                 with open(fallback_source, "r", encoding="utf-8") as f:
-                    return f.read()
+                    return _sanitize_for_llm(f.read())
             except Exception:
                 pass
 

@@ -416,7 +416,7 @@ class LiveCloudFetcher:
         elif chosen_opt["type"] == "external":
             endpoint = self._safe_prompt("Kubernetes API Server Endpoint (e.g. https://1.2.3.4:6443)")
             token = self._safe_prompt("Bearer Token", password=True)
-            insecure = Confirm.ask("Skip SSL certificate verification?", default=True)
+            insecure = Confirm.ask("Skip SSL certificate verification?", default=False)
             self.k8s_conn_params = {
                 "k8s_endpoint": endpoint,
                 "k8s_token": token,

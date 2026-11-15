@@ -163,9 +163,22 @@ class ContextualGraph:
         self.graph = nx.DiGraph()
 
     def add_node(self, node: BaseNode):
-        """Adds a typed semantic node to the graph."""
+        """Adds a typed semantic node to the graph with collision protection."""
+        node_id = node.id
+        if self.graph.has_node(node_id):
+            existing_attrs = self.graph.nodes[node_id]
+            if existing_attrs.get("source_file") == node.source_file and existing_attrs.get("name") == node.name:
+                return
+            idx = 2
+            cand_id = f"{node_id}:{idx}"
+            while self.graph.has_node(cand_id):
+                idx += 1
+                cand_id = f"{node_id}:{idx}"
+            node_id = cand_id
+            node.id = node_id
+
         self.graph.add_node(
-            node.id,
+            node_id,
             name=node.name,
             label=node.name,
             node_type=node.type.value,
@@ -275,6 +288,7 @@ class ContextualGraph:
 
                     cond = stmt.get("Condition", {}) or {}
                     expected_sub = f"system:serviceaccount:{sa.namespace}:{sa.name}"
+                    has_sub_cond = False
                     for op in ("StringEquals", "StringLike"):
                         string_match = cond.get(op, {}) or {}
                         if not isinstance(string_match, dict):
@@ -283,6 +297,7 @@ class ContextualGraph:
                             ck_str = str(cond_key)
                             if ":sub" not in ck_str:
                                 continue
+                            has_sub_cond = True
                             if oidc_hosts and ":" in ck_str:
                                 key_host = ck_str.rsplit(":", 1)[0]
                                 if key_host and not any(h in key_host or key_host in h for h in oidc_hosts):
@@ -292,6 +307,8 @@ class ContextualGraph:
                                 isinstance(v, str)
                                 and (
                                     v == expected_sub
+                                    or v == "*"
+                                    or v == "system:serviceaccount:*:*"
                                     or (op == "StringLike" and fnmatch.fnmatchcase(expected_sub, v))
                                 )
                                 for v in val_list
@@ -304,6 +321,15 @@ class ContextualGraph:
                                     protocol="OIDC WebIdentityFederation",
                                     sub_claim=cond_val
                                 )
+                    # Unconstrained OIDC trust: if trust omits :sub condition entirely, any SA on that OIDC host can assume
+                    if not has_sub_cond and oidc_hosts and not self.graph.has_edge(sa.id, r.id):
+                        self.add_edge(
+                            sa.id,
+                            r.id,
+                            EdgeType.IRSA_ASSUMES,
+                            protocol="OIDC WebIdentityFederation (Unconstrained - Missing :sub)",
+                            sub_claim="*"
+                        )
 
         # 4. Link IAM Role -> IAM Policy (Exact Attachment Matching)
         for att in attachments:
@@ -428,6 +454,47 @@ class ContextualGraph:
                                 is_wildcard=(match_kind == "wildcard"),
                                 lethal_flaw=True,
                                 via_resource_policy=True
+                            )
+
+        # 5c. Link Direct IAM Policy -> S3 Bucket (Direct S3 Storage Access via IAM Policy)
+        def _policy_stmt_allows_s3_read(s: PolicyStatement) -> bool:
+            if s.actions:
+                return any(str(a).strip().lower() in ("*", "s3:*", "s3:getobject", "s3:get*", "s3:listbucket") for a in s.actions)
+            if s.not_actions:
+                return not any(str(a).strip().lower() in ("*", "s3:*", "s3:getobject") for a in s.not_actions)
+            return False
+
+        def _stmt_targets_bucket(s: PolicyStatement, bucket: S3BucketNode) -> tuple:
+            b_arn = bucket.bucket_arn or f"arn:aws:s3:::{bucket.bucket_name}"
+            b_clean = b_arn.rstrip("/")
+            for res in s.resources:
+                r_s = str(res).strip()
+                if r_s == "*":
+                    return True, True
+                if r_s == b_clean or r_s.startswith(f"{b_clean}/") or bucket.bucket_name in r_s:
+                    return True, False
+            if s.not_resources:
+                if any(str(nr).strip() == "*" for nr in s.not_resources):
+                    return False, False
+                return True, True
+            return False, False
+
+        for p in policies:
+            for stmt in p.statements:
+                if stmt.effect.strip().lower() != "allow" or not _policy_stmt_allows_s3_read(stmt):
+                    continue
+                for b in s3_buckets:
+                    targets_b, is_wild = _stmt_targets_bucket(stmt, b)
+                    if targets_b:
+                        is_lethal = is_wild and not statement_has_principal_or_source_restriction(stmt.conditions)
+                        if not self.graph.has_edge(p.id, b.id):
+                            self.add_edge(
+                                p.id,
+                                b.id,
+                                EdgeType.ALLOWS_STORAGE_ACCESS,
+                                actions=list(stmt.actions or ["s3:GetObject"]),
+                                is_wildcard=is_wild,
+                                lethal_flaw=is_lethal
                             )
 
         # 6. Link KMS Key -> S3 Bucket (Only when Bucket uses that CMK)

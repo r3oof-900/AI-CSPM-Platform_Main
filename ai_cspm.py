@@ -41,7 +41,7 @@ from rich.tree import Tree
 
 from core.graph import ContextualGraph
 from core.analyzer import AttackPathAnalyzer
-from core.models import AttackPath, MisconfigurationFinding, RemediationResult
+from core.models import AttackPath, MisconfigurationFinding, RemediationResult, Severity, FindingCategory
 from ingestion.k8s_parser import K8sParser
 from ingestion.tf_parser import TerraformParser
 from ingestion.aws_json_parser import AwsJsonParser
@@ -348,6 +348,36 @@ def run_scan(
         attack_paths = analyzer.find_cross_layer_attack_paths()
         misconfigs = analyzer.audit_all_misconfigurations(attack_paths=attack_paths)
 
+        # Evaluate Parsing Integrity & Asset Discovery
+        has_parse_errors = any("Error reading" in w or "Error parsing" in w or "syntax error" in w.lower() for w in parse_warnings)
+        if has_parse_errors:
+            misconfigs.append(MisconfigurationFinding(
+                id="SEC-PARSE-001",
+                title="Infrastructure-as-Code Syntax or Parsing Failure",
+                category=FindingCategory.CROSS_LAYER,
+                severity=Severity.HIGH,
+                resource_id=target_dir or "manifest",
+                resource_type="iac_parse_error",
+                layer="IaC",
+                description="One or more Terraform or Kubernetes manifests failed to parse due to syntax errors or corrupt configuration.",
+                remediation_recommendation="Fix syntax errors in IaC files before running security posture scan.",
+                cvss_score=8.0
+            ))
+
+        if len(cg.graph.nodes()) == 0 and target_dir and not is_aicspm_snapshot:
+            misconfigs.append(MisconfigurationFinding(
+                id="SEC-PARSE-002",
+                title="No Cloud or Kubernetes Infrastructure Assets Discovered in Target",
+                category=FindingCategory.CROSS_LAYER,
+                severity=Severity.MEDIUM,
+                resource_id=target_dir,
+                resource_type="empty_target",
+                layer="IaC",
+                description=f"Scan target '{target_dir}' contains no valid or recognized Kubernetes workloads, IAM policies, KMS keys, or S3 resources.",
+                remediation_recommendation="Ensure target directory contains valid Terraform (.tf) or Kubernetes (.yaml) files.",
+                cvss_score=5.0
+            ))
+
     severity_counts = {"CRITICAL": 0, "HIGH": 0, "MEDIUM": 0, "LOW": 0, "INFO": 0}
     for m in misconfigs:
         sev_key = m.severity.value
@@ -392,9 +422,24 @@ def run_scan(
         remediation_providers = []
         remediation_warnings = []
         ai_warnings = []
+        remediation_cache = {}
         for ap in attack_paths:
+            root_cause_key = (ap.root_cause, ap.nodes[-1].get("name") if ap.nodes else "")
+            if root_cause_key in remediation_cache:
+                cached_rem = remediation_cache[root_cause_key]
+                remediations.append(RemediationResult(
+                    attack_path_id=ap.id,
+                    original_code=cached_rem.original_code,
+                    remediated_code=cached_rem.remediated_code,
+                    explanation=cached_rem.explanation,
+                    least_privilege_changes=cached_rem.least_privilege_changes,
+                    risk_reduction=cached_rem.risk_reduction
+                ))
+                continue
+
             rem = ai_engine.synthesize_remediation(ap, offline_mode=offline_mode)
             remediations.append(rem)
+            remediation_cache[root_cause_key] = rem
             if ai_engine.last_provider not in remediation_providers:
                 remediation_providers.append(ai_engine.last_provider)
             if ai_engine.last_error:
@@ -469,17 +514,16 @@ def run_scan(
                 console.print(f"\n[bold green]✔ Containment Score:[/] {ap_remediation.risk_reduction}")
 
                 # Benchmark Matrix
-                comp_table = Table(title="🔬 Benchmark Comparison Against Existing CSPM Scanners", border_style="yellow")
-                comp_table.add_column("Evaluated Tool", style="bold white", width=25)
-                comp_table.add_column("Scanner Outcome", style="bold red", width=22)
-                comp_table.add_column("Why It Missed This Lethal Attack Path", style="dim")
+                comp_table = Table(title="🔬 Architectural Gap Analysis: Why Single-Layer Scanners Miss Cross-Layer Chains", border_style="yellow")
+                comp_table.add_column("Scanner Category", style="bold white", width=25)
+                comp_table.add_column("Detection Scope", style="bold red", width=22)
+                comp_table.add_column("Architectural Limitation", style="dim")
 
-                comp_table.add_row("Prowler v5.46", "100% [PASS] (Missed)", "Evaluates *:* only; blind to wildcard kms:Decrypt")
-                comp_table.add_row("ScoutSuite 5.14", "0 Findings (Missed)", "Disjoint report; zero Kubernetes workload awareness")
-                comp_table.add_row("AWS Access Analyzer", "{'findings': []} (Missed)", "Grammar-only check; wildcard is valid JSON syntax")
-                comp_table.add_row("ARMO Kubescape v4", "Score 67.15% (Missed)", "Halts at K8s cluster boundary; cannot reach AWS IAM")
-                comp_table.add_row("Checkov v3.3", "17 Siloed Findings", "Separates K8s and Terraform into isolated execution targets")
-                comp_table.add_row("Proposed AI-CSPM", "[bold green]DETECTED & REMEDIATED[/]", "Correlates K8s IRSA -> IAM Role -> KMS CMK -> S3 Vault")
+                comp_table.add_row("Cloud IAM Scanners", "Isolated Policy Syntax", "Evaluates policy syntax and global admin wildcards; blind to K8s OIDC pod token links")
+                comp_table.add_row("Kubernetes Scanners", "In-Cluster Boundaries", "Halts at K8s cluster boundary; cannot traverse STS AssumeRole to KMS and S3")
+                comp_table.add_row("Access Analyzers", "Grammar & Policies", "Validates syntax and reachable resources; misses multi-tier chained trust paths")
+                comp_table.add_row("Standard IaC Linters", "Siloed Resource Files", "Separates K8s YAML and Terraform into isolated files without building a unified DAG")
+                comp_table.add_row("Contextual AI-CSPM", "[bold green]DETECTED & REMEDIATED[/]", "Synthesizes cross-layer DAG: K8s Workload -> IRSA -> IAM Role -> KMS CMK -> S3 Vault")
 
                 console.print(comp_table)
 
@@ -634,8 +678,15 @@ def run_scan(
     if apply_fix and remediations:
         if live_mode or live_demo:
             patch_file = os.path.join(os.getcwd(), "remediated_live_least_privilege.tf")
+            seen_blocks = set()
+            unique_blocks = []
+            for r in remediations:
+                code_strip = (r.remediated_code or "").strip()
+                if code_strip and code_strip not in seen_blocks:
+                    seen_blocks.add(code_strip)
+                    unique_blocks.append(code_strip)
             with open(patch_file, "w", encoding="utf-8") as f:
-                f.write("\n\n".join(r.remediated_code for r in remediations))
+                f.write("\n\n".join(unique_blocks))
             if format_type == "console":
                 console.print(Panel(
                     f"[bold green]✔ Live Environment Least-Privilege IaC Patch Synthesized to:[/] \n[cyan]{patch_file}[/]\n\n"
@@ -771,7 +822,8 @@ Examples:
     )
     parser.add_argument(
         "--k8s-token",
-        help="Bearer Token for external Kubernetes cluster"
+        default=os.environ.get("K8S_TOKEN"),
+        help="Bearer Token for external Kubernetes cluster (can also be provided via K8S_TOKEN env var to avoid shell history leakage)"
     )
     parser.add_argument(
         "--k8s-ca-cert",

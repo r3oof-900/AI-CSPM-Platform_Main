@@ -202,10 +202,12 @@ class TerraformParser:
                 for v_name, v_val in data.items():
                     val = self._unwrap_hcl_val(v_val)
                     self.variables[v_name] = val
-                    if v_name == "aws_account_id":
+                    if v_name in ("aws_account_id", "account_id", "account"):
                         self.account_id = str(val)
                     elif v_name in ["aws_region", "region"]:
                         self.region = str(val)
+                    elif isinstance(val, str) and re.match(r"^\d{12}$", val.strip()):
+                        self.account_id = val.strip()
         except Exception as exc:
             self.parse_warnings.append(f"Error reading tfvars {filepath}: {exc}")
 
@@ -291,10 +293,12 @@ class TerraformParser:
                 if "default" in v_data:
                     val = self._unwrap_hcl_val(v_data["default"])
                     self.variables[v_name] = val
-                    if v_name == "aws_account_id":
+                    if v_name in ("aws_account_id", "account_id", "account"):
                         self.account_id = str(val)
                     elif v_name in ["aws_region", "region"]:
                         self.region = str(val)
+                    elif isinstance(val, str) and re.match(r"^\d{12}$", val.strip()):
+                        self.account_id = val.strip()
 
         # Locals
         for loc_wrapper in obj.get("locals", []):
@@ -418,10 +422,15 @@ class TerraformParser:
             self.parse_warnings.append(f"Error reading HCL2 file {filepath}: {e}")
             return
 
+        if "module" in obj:
+            self.parse_warnings.append(f"Terraform module block detected in {filepath}: modules are not recursively inlined.")
+
         resources = obj.get("resource", [])
         for res_wrapper in resources:
             for res_type, res_entries in res_wrapper.items():
                 for res_id, res_data in res_entries.items():
+                    if "for_each" in res_data:
+                        self.parse_warnings.append(f"Terraform for_each detected on {res_type}.{res_id} in {filepath}: only primary instance evaluated.")
                     if res_type == "aws_iam_role":
                         self._process_iam_role(res_id, res_data, filepath)
                     elif res_type == "aws_iam_policy":
@@ -511,8 +520,17 @@ class TerraformParser:
             for s in statements
         )
 
+        existing_pol_ids = {p.id for p in self.policies}
+        base_id = f"iam:policy:{name}"
+        if base_id in existing_pol_ids:
+            pol_id = f"iam:policy:{name}_{res_id}"
+            if pol_id in existing_pol_ids:
+                pol_id = f"iam:policy:{name}_{res_id}_{len(existing_pol_ids)}"
+        else:
+            pol_id = base_id
+
         policy_node = IAMPolicyNode(
-            id=f"iam:policy:{name}",
+            id=pol_id,
             name=name,
             policy_arn=f"arn:aws:iam::{self.account_id}:policy/{name}",
             statements=statements,
@@ -613,6 +631,30 @@ class TerraformParser:
         # Support legacy inline server_side_encryption_configuration block inside aws_s3_bucket
         if "server_side_encryption_configuration" in data:
             self._extract_sse_kms_from_block(res_id, data["server_side_encryption_configuration"])
+
+        count_raw = self._unwrap_hcl_val(data.get("count"), 1)
+        count_val = 1
+        if isinstance(count_raw, int):
+            count_val = count_raw
+        elif isinstance(count_raw, str):
+            resolved_count = self._resolve_interpolated_string(count_raw)
+            if resolved_count.isdigit():
+                count_val = int(resolved_count)
+
+        if count_val > 1:
+            for idx in range(count_val):
+                inst_res_id = f"{res_id}[{idx}]"
+                inst_b_name = f"{b_name}-{idx}" if not b_name.endswith(f"-{idx}") else b_name
+                bucket_node = S3BucketNode(
+                    id=f"s3:bucket:{inst_res_id}",
+                    name=inst_res_id,
+                    bucket_name=inst_b_name,
+                    bucket_arn=f"arn:aws:s3:::{inst_b_name}",
+                    source_file=filepath,
+                    properties={"tags": tags_raw if isinstance(tags_raw, dict) else {}, "res_id": inst_res_id}
+                )
+                self.s3_buckets.append(bucket_node)
+            return
 
         bucket_node = S3BucketNode(
             id=f"s3:bucket:{res_id}",

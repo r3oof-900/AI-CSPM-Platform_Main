@@ -177,11 +177,10 @@ class AttackPathAnalyzer:
                             f"unrestricted capabilities to decrypt database and storage assets across the cloud tenant."
                         ),
                         false_negative_tools=[
-                            "Prowler v5.46 (Gave 100% PASS - checks *:* only)",
-                            "ScoutSuite 5.14 (0 findings - no Kubernetes awareness)",
-                            "AWS IAM Access Analyzer (findings: [] - syntax valid)",
-                            "ARMO Kubescape (Halts at Kubernetes cluster boundary)",
-                            "Checkov & Trivy (Segregated inspection - misses cross-layer link)"
+                            "Single-layer IAM policy scanners (lack K8s OIDC correlation)",
+                            "Standard K8s linters (halt at cluster boundary)",
+                            "AWS Access Analyzer (validates syntax/conditions, misses cross-layer workload graph)",
+                            "Siloed IaC analyzers (separate K8s and Terraform into isolated targets)"
                         ]
                     )
                     attack_paths.append(ap)
@@ -242,6 +241,34 @@ class AttackPathAnalyzer:
                         ))
                         break
 
+                # Check for unrestricted S3 wildcard grants (s3:* or s3:GetObject on Resource '*')
+                for s in stmts:
+                    if s.effect.strip().lower() != "allow":
+                        continue
+                    s3_acts = [str(a).lower().strip() for a in s.actions]
+                    is_s3_wildcard = any(a in ("*", "s3:*", "s3:getobject", "s3:get*") for a in s3_acts)
+                    is_res_wild = any(str(r).strip() == "*" for r in s.resources)
+                    if is_s3_wildcard and is_res_wild and not statement_has_principal_or_source_restriction(s.conditions):
+                        findings.append(MisconfigurationFinding(
+                            id="SEC-IAM-005",
+                            title="Overprivileged IAM Action: S3 Storage Read/Admin Granted on Wildcard Resource '*'",
+                            category=FindingCategory.STORAGE,
+                            severity=Severity.HIGH,
+                            resource_id=policy_name,
+                            resource_type="aws_iam_policy",
+                            layer="IAM",
+                            description=(
+                                f"Policy '{policy_name}' allows unrestricted S3 access ('{', '.join(s.actions[:3])}') on Resource '*'. "
+                                "This grants broad exfiltration access across all storage buckets in the AWS account."
+                            ),
+                            remediation_recommendation=(
+                                "Scope S3 Resource strictly to authorized bucket ARNs and enforce aws:PrincipalOrgID or aws:SourceVpce conditions."
+                            ),
+                            compliance_controls=["CIS AWS Foundations 1.16", "PCI-DSS v4.0 Req 3.4", "NIST SP 800-53 AC-6"],
+                            cvss_score=8.5
+                        ))
+                        break
+
             # 2. Inspect IAM Roles and Trust Policies
             elif d.get("node_type") == NodeType.IAM_ROLE.value:
                 role_name = d.get("name", n)
@@ -270,8 +297,17 @@ class AttackPathAnalyzer:
                                 cond_keys.extend(str(k) for k in sub_map.keys())
                         has_sub = any(":sub" in k for k in cond_keys)
                         has_aud = any(":aud" in k for k in cond_keys)
+                        has_wildcard_sub = False
+                        for op in ("StringEquals", "StringLike"):
+                            sub_map = cond.get(op, {})
+                            if isinstance(sub_map, dict):
+                                for k, v in sub_map.items():
+                                    if ":sub" in str(k).lower():
+                                        vals = [v] if isinstance(v, (str, int)) else (v if isinstance(v, list) else [])
+                                        if any(str(item).strip() in ("*", "system:serviceaccount:*:*", "system:serviceaccount:*") or str(item).endswith(":*") for item in vals):
+                                            has_wildcard_sub = True
 
-                        if not has_sub or not has_aud:
+                        if not has_sub or not has_aud or has_wildcard_sub:
                             findings.append(MisconfigurationFinding(
                                 id="SEC-IAM-002",
                                 title="Overbroad EKS OIDC Federated Trust Relationship",
@@ -282,7 +318,8 @@ class AttackPathAnalyzer:
                                 layer="IAM",
                                 description=(
                                     f"IAM Role '{role_name}' uses sts:AssumeRoleWithWebIdentity. The OIDC condition "
-                                    "lacks strict sub or aud claim verification, permitting unauthorized containers to assume this role."
+                                    + ("uses a wildcard sub claim allowing arbitrary ServiceAccounts to assume this role."
+                                       if has_wildcard_sub else "lacks strict sub or aud claim verification, permitting unauthorized containers to assume this role.")
                                 ),
                                 remediation_recommendation="Enforce strict StringEquals on both oidc:sub and oidc:aud.",
                                 compliance_controls=["CIS AWS Foundations 1.20", "AWS EKS Security Best Practices", "NIST AC-2"],
@@ -290,7 +327,8 @@ class AttackPathAnalyzer:
                             ))
                             break
 
-                # Check permissions boundary (skip AWS Service-Linked Roles where AWS forbids boundaries)
+                # Check permissions boundary on federated/workload execution roles
+                # (skip AWS Service-Linked Roles and non-workload roles without federated trust)
                 role_path = str(props.get("path") or raw_props.get("path") or "")
                 role_arn_str = str(getattr(obj, "role_arn", "") or props.get("role_arn") or "")
                 is_service_linked = (
@@ -300,16 +338,22 @@ class AttackPathAnalyzer:
                 )
                 has_boundary = ("permissions_boundary" in raw_props) or bool(props.get("permissions_boundary"))
                 if not has_boundary and not is_service_linked:
+                    is_fed = bool(getattr(obj, "oidc_provider", None)) or any(
+                        "AssumeRoleWithWebIdentity" in str(stmt.get("Action", []))
+                        for stmt in (trust_policy.get("Statement", []) if isinstance(trust_policy.get("Statement"), list) else [trust_policy.get("Statement", {})])
+                        if isinstance(stmt, dict)
+                    )
+                    title_text = "IAM Federated Execution Role Missing Permissions Boundary" if is_fed else "IAM Workload/Application Role Missing Permissions Boundary"
                     findings.append(MisconfigurationFinding(
                         id="SEC-IAM-004",
-                        title="IAM Federated Execution Role Missing Permissions Boundary",
+                        title=title_text,
                         category=FindingCategory.CLOUD_IAM,
                         severity=Severity.MEDIUM,
                         resource_id=role_name,
                         resource_type="aws_iam_role",
                         layer="IAM",
                         description=(
-                            f"The execution role '{role_name}' lacks an attached permissions_boundary. If an identity "
+                            f"The role '{role_name}' lacks an attached permissions_boundary. If an identity "
                             "manipulates policy attachments, privilege escalation to AdministratorAccess is possible."
                         ),
                         remediation_recommendation="Define and attach an explicit IAM permissions_boundary to all workload roles.",
