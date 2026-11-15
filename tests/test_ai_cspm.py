@@ -2267,3 +2267,316 @@ def test_gemini_prompt_grounding_retry_and_post_llm_guardrail():
         with patch("requests.post", return_value=resp_503):
             parsed, err = post_gemini_json("https://example.invalid", "k", "p", 5, max_attempts=2, backoff_sec=0.1)
             assert parsed is None and "HTTP 503" in err
+
+
+def test_k8s_auth_engine_eks_token_generation():
+    from ingestion.k8s_auth_engine import K8sAuthEngine
+
+    # 1. Valid token generation
+    fake_session = MagicMock()
+    fake_session.region_name = "us-east-1"
+    fake_creds = MagicMock()
+    fake_session.get_credentials.return_value = fake_creds
+    fake_sts = MagicMock()
+    fake_sts.meta.service_model.service_id = "STS"
+    fake_sts.meta.events = MagicMock()
+    fake_session.client.return_value = fake_sts
+
+    with patch("ingestion.k8s_auth_engine.RequestSigner") as mock_signer_cls:
+        mock_signer = MagicMock()
+        mock_signer.generate_presigned_url.return_value = "https://sts.us-east-1.amazonaws.com/?Action=GetCallerIdentity&test=1"
+        mock_signer_cls.return_value = mock_signer
+
+        token = K8sAuthEngine.generate_eks_token("prod-cluster", fake_session)
+        assert token.startswith("k8s-aws-v1.")
+        # Ensure operation_name was passed to generate_presigned_url
+        mock_signer.generate_presigned_url.assert_called_once()
+        args, kwargs = mock_signer.generate_presigned_url.call_args
+        assert args[1] == "GetCallerIdentity"
+        assert kwargs.get("expires_in") == 60
+
+    # 2. Invalid cluster name raises ValueError
+    with pytest.raises(ValueError, match="Cluster name"):
+        K8sAuthEngine.generate_eks_token("", fake_session)
+
+    # 3. Missing credentials raises ValueError
+    fake_session_nocreds = MagicMock()
+    fake_session_nocreds.get_credentials.return_value = None
+    with pytest.raises(ValueError, match="credentials not found"):
+        K8sAuthEngine.generate_eks_token("prod-cluster", fake_session_nocreds)
+
+
+def test_k8s_auth_engine_get_eks_client():
+    from ingestion.k8s_auth_engine import K8sAuthEngine
+    from kubernetes import client
+
+    fake_session = MagicMock()
+    fake_eks = MagicMock()
+    ca_dummy_b64 = "dGVzdC1jZXJ0LWRhdGE="  # "test-cert-data"
+    fake_eks.describe_cluster.return_value = {
+        "cluster": {
+            "endpoint": "https://fake-eks-endpoint.amazonaws.com",
+            "certificateAuthority": {"data": ca_dummy_b64}
+        }
+    }
+    fake_session.client.return_value = fake_eks
+
+    with patch.object(K8sAuthEngine, "generate_eks_token", return_value="k8s-aws-v1.fake-token"):
+        api_client = K8sAuthEngine.get_eks_client("my-cluster", fake_session)
+        assert isinstance(api_client, client.ApiClient)
+        conf = api_client.configuration
+        assert conf.host == "https://fake-eks-endpoint.amazonaws.com"
+        assert conf.verify_ssl is True
+        assert os.path.exists(conf.ssl_ca_cert)
+        with open(conf.ssl_ca_cert, "r", encoding="utf-8") as f:
+            assert f.read() == "test-cert-data"
+        assert conf.api_key.get("authorization") == "k8s-aws-v1.fake-token"
+        assert conf.api_key_prefix.get("authorization") == "Bearer"
+
+
+def test_k8s_auth_engine_external_and_auto_connect():
+    from ingestion.k8s_auth_engine import K8sAuthEngine
+    from kubernetes import client
+
+    # 1. External client without CA (insecure)
+    ext_client = K8sAuthEngine.get_external_k8s_client(
+        endpoint="https://192.168.1.100:6443",
+        token="ext-token-123",
+        verify_ssl=False
+    )
+    assert isinstance(ext_client, client.ApiClient)
+    assert ext_client.configuration.host == "https://192.168.1.100:6443"
+    assert ext_client.configuration.verify_ssl is False
+    assert ext_client.configuration.api_key.get("authorization") == "ext-token-123"
+
+    # 2. External client with CA
+    ca_b64 = "Y3VzdG9tLWNh"  # "custom-ca"
+    ext_client_ca = K8sAuthEngine.get_external_k8s_client(
+        endpoint="https://k3s.example.com",
+        token="tok",
+        ca_cert_base64=ca_b64,
+        verify_ssl=True
+    )
+    assert ext_client_ca.configuration.verify_ssl is True
+    assert os.path.exists(ext_client_ca.configuration.ssl_ca_cert)
+
+    # 3. auto_connect routes to external when endpoint and token provided
+    with patch.object(K8sAuthEngine, "get_external_k8s_client", return_value="routed_external") as mock_ext:
+        res = K8sAuthEngine.auto_connect(k8s_endpoint="https://test", k8s_token="tok")
+        assert res == "routed_external"
+        mock_ext.assert_called_once()
+
+    # 4. auto_connect routes to EKS when session and cluster_name provided
+    with patch.object(K8sAuthEngine, "get_eks_client", return_value="routed_eks") as mock_eks:
+        fake_sess = MagicMock()
+        res = K8sAuthEngine.auto_connect(aws_session=fake_sess, cluster_name="eks-c")
+        assert res == "routed_eks"
+        mock_eks.assert_called_once()
+
+    # 5. auto_connect raises RuntimeError when no valid params provided
+    with patch("os.path.exists", return_value=False):
+        with pytest.raises(RuntimeError, match="No valid Kubernetes connection parameters"):
+            K8sAuthEngine.auto_connect()
+
+
+def test_live_cloud_parser_k8s_auth_engine_integration():
+    from ingestion.live_cloud_parser import LiveCloudFetcher
+    from ingestion.k8s_auth_engine import K8sAuthEngine
+
+    fetcher = LiveCloudFetcher(quiet=True)
+    fetcher.k8s_conn_params = {
+        "k8s_endpoint": "https://external-k8s.local:6443",
+        "k8s_token": "bearer-token-xyz",
+        "k8s_insecure": True
+    }
+
+    mock_core_v1 = MagicMock()
+    mock_apps_v1 = MagicMock()
+    mock_rbac_v1 = MagicMock()
+    mock_net_v1 = MagicMock()
+    mock_batch_v1 = MagicMock()
+
+    ns_item = MagicMock()
+    ns_item.metadata.name = "default"
+    mock_core_v1.list_namespace.return_value.items = [ns_item]
+    mock_core_v1.list_service_account_for_all_namespaces.return_value.items = []
+    mock_core_v1.list_pod_for_all_namespaces.return_value.items = []
+    mock_apps_v1.list_deployment_for_all_namespaces.return_value.items = []
+    mock_apps_v1.list_stateful_set_for_all_namespaces.return_value.items = []
+    mock_apps_v1.list_daemon_set_for_all_namespaces.return_value.items = []
+    mock_batch_v1.list_job_for_all_namespaces.return_value.items = []
+    mock_batch_v1.list_cron_job_for_all_namespaces.return_value.items = []
+    mock_rbac_v1.list_role_for_all_namespaces.return_value.items = []
+    mock_rbac_v1.list_cluster_role.return_value.items = []
+    mock_rbac_v1.list_role_binding_for_all_namespaces.return_value.items = []
+    mock_rbac_v1.list_cluster_role_binding.return_value.items = []
+    mock_net_v1.list_network_policy_for_all_namespaces.return_value.items = []
+
+    fake_api_client = MagicMock()
+    with patch.object(K8sAuthEngine, "auto_connect", return_value=fake_api_client) as mock_auto:
+        with patch("ingestion.live_cloud_parser.k8s_client") as mock_client_mod:
+            mock_client_mod.CoreV1Api.return_value = mock_core_v1
+            mock_client_mod.AppsV1Api.return_value = mock_apps_v1
+            mock_client_mod.RbacAuthorizationV1Api.return_value = mock_rbac_v1
+            mock_client_mod.NetworkingV1Api.return_value = mock_net_v1
+            mock_client_mod.BatchV1Api.return_value = mock_batch_v1
+
+            fetcher.fetch_k8s_live_assets(context_name="external:https://external-k8s.local:6443", namespace="all")
+            mock_auto.assert_called_once()
+            assert fetcher.namespaces == ["default"]
+            assert fetcher.k8s_api_client == fake_api_client
+
+
+def test_ai_cspm_cli_k8s_options():
+    import ai_cspm
+
+    test_args = [
+        "--live",
+        "--eks-cluster", "prod-cluster-01",
+        "--k8s-endpoint", "https://10.0.0.1:6443",
+        "--k8s-token", "secret-token",
+        "--k8s-ca-cert", "dGVzdA==",
+        "--k8s-insecure"
+    ]
+
+    with patch("sys.argv", ["ai_cspm.py"] + test_args):
+        with patch("ai_cspm.run_scan", return_value=0) as mock_run:
+            try:
+                ai_cspm.main()
+            except SystemExit:
+                pass
+            mock_run.assert_called_once()
+            kwargs = mock_run.call_args.kwargs
+            assert kwargs["eks_cluster"] == "prod-cluster-01"
+            assert kwargs["k8s_endpoint"] == "https://10.0.0.1:6443"
+            assert kwargs["k8s_token"] == "secret-token"
+            assert kwargs["k8s_ca_cert"] == "dGVzdA=="
+            assert kwargs["k8s_insecure"] is True
+
+
+def test_interactive_aws_wizard_manual_keys_and_profile_choice(monkeypatch):
+    from ingestion.live_cloud_parser import LiveCloudFetcher
+
+    fetcher = LiveCloudFetcher(quiet=False)
+    monkeypatch.setattr(fetcher, "get_available_aws_profiles", lambda: ["default", "live-test"])
+
+    # Test choice 'K' prompts for manual keys
+    inputs = iter(["k", "AKIAMANUALKEY12345", "SuperSecretKeyManual12345", "eu-central-1"])
+    monkeypatch.setattr(fetcher, "_safe_prompt", lambda *a, **kw: next(inputs))
+
+    sess, region, is_demo = fetcher.prompt_aws_configuration()
+    assert is_demo is False
+    assert region == "eu-central-1"
+    creds = sess.get_credentials()
+    assert creds.access_key == "AKIAMANUALKEY12345"
+    assert creds.secret_key == "SuperSecretKeyManual12345"
+
+
+def test_native_aicspm_snapshot_file_ingestion(tmp_path, capsys):
+    from ai_cspm import run_scan
+
+    snap_file = tmp_path / "offline_export_snapshot.json"
+    dummy_payload = {
+        "tool": "AI-CSPM Standalone CLI",
+        "version": "1.0.0",
+        "target_source": "live-cluster",
+        "metrics": {
+            "total_assets": 2,
+            "total_relationships": 1,
+            "critical_attack_paths": 1,
+            "total_misconfigurations": 1,
+            "severity_counts": {"CRITICAL": 1, "HIGH": 0, "MEDIUM": 0, "LOW": 0, "INFO": 0},
+            "containment_score": "50%",
+            "posture_score": "75%"
+        },
+        "graph_summary": {
+            "nodes": [
+                {
+                    "id": "k8s:workload:prod:web-app",
+                    "label": "web-app",
+                    "type": "WORKLOAD",
+                    "layer": "Kubernetes",
+                    "source_file": "k8s://cluster/prod/deployment/web-app"
+                },
+                {
+                    "id": "aws:kms:key:dummy-cmk-id",
+                    "label": "dummy-cmk-id",
+                    "type": "KMS_KEY",
+                    "layer": "Cryptography",
+                    "source_file": "aws://kms/dummy-cmk-id"
+                }
+            ],
+            "edges": [
+                {
+                    "source": "k8s:workload:prod:web-app",
+                    "target": "aws:kms:key:dummy-cmk-id",
+                    "type": "ALLOWS_DECRYPT",
+                    "is_wildcard": True,
+                    "lethal_flaw": True
+                }
+            ]
+        },
+        "attack_paths": [
+            {
+                "id": "AP-999",
+                "title": "Offline Snapshot Ingested Path",
+                "severity": "CRITICAL",
+                "nodes": [
+                    {"id": "k8s:workload:prod:web-app", "label": "web-app", "type": "WORKLOAD"},
+                    {"id": "aws:kms:key:dummy-cmk-id", "label": "dummy-cmk-id", "type": "KMS_KEY"}
+                ],
+                "steps": ["Step 1", "Step 2"],
+                "root_cause": "Wildcard CMK policy",
+                "impact": "Data Exfiltration",
+                "false_negative_tools": ["Checkov"]
+            }
+        ],
+        "misconfigurations": [
+            {
+                "id": "SEC-TEST-001",
+                "title": "Test Snapshot Defect",
+                "category": "Cloud IAM & Permissions",
+                "severity": "CRITICAL",
+                "resource_id": "aws:kms:key:dummy-cmk-id",
+                "resource_type": "KMS_KEY",
+                "layer": "Cryptography",
+                "description": "Overpermissive key",
+                "remediation_recommendation": "Restrict ARN",
+                "compliance_controls": ["NIST-800-53"],
+                "cvss_score": 9.5
+            }
+        ],
+        "remediations": [],
+        "consensus": {
+            "unanimous_decision": "CERTIFIED VULNERABLE",
+            "consensus_status": "VULNERABLE",
+            "engine_provider": "Deterministic Mock",
+            "red_team": {"role": "Red-Team", "status": "CONFIRMED", "blast_radius": "High", "attack_vector_en": "Exploited"},
+            "blue_team": {"role": "Blue-Team", "status": "PATCH_REQUIRED", "defense_strategy_en": "Scope IAM"},
+            "arbiter": {"role": "Arbiter", "cvss_v4_score": 9.5}
+        }
+    }
+    snap_file.write_text(json.dumps(dummy_payload), encoding="utf-8")
+
+    html_out = tmp_path / "test_out.html"
+    graph_out = tmp_path / "graph_out.html"
+
+    rc = run_scan(
+        target_dir=str(snap_file),
+        offline_mode=True,
+        format_type="json",
+        html_output_path=str(html_out),
+        graph_output_path=str(graph_out)
+    )
+    assert rc == 1  # Fails closed on critical attack path
+    captured = capsys.readouterr()
+    res = json.loads(captured.out)
+    assert res["metrics"]["total_assets"] == 2
+    assert res["metrics"]["critical_attack_paths"] == 1
+    assert len(res["attack_paths"]) == 1
+    assert res["attack_paths"][0]["id"] == "AP-999"
+    assert html_out.exists() and html_out.stat().st_size > 1000
+    assert graph_out.exists() and graph_out.stat().st_size > 500
+
+
+

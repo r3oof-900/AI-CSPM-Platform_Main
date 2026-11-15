@@ -26,6 +26,11 @@ except ImportError:
     HAS_K8S_CLIENT = False
 
 try:
+    from ingestion.k8s_auth_engine import K8sAuthEngine
+except (ImportError, ValueError):
+    from .k8s_auth_engine import K8sAuthEngine
+
+try:
     from core.models import (
         NodeType,
         WorkloadNode,
@@ -89,6 +94,8 @@ class LiveCloudFetcher:
         self.network_policies: Dict[str, List[Any]] = {}
         self.namespaces: List[str] = []
         self.warnings: List[str] = []
+        self.k8s_api_client: Optional[Any] = None
+        self.k8s_conn_params: Dict[str, Any] = {}
 
     def _safe_prompt(
         self,
@@ -226,11 +233,18 @@ class LiveCloudFetcher:
                 table.add_row(str(i), p, "~/.aws/credentials")
             console.print(table)
 
-            console.print("[dim]Select an existing profile number, type a custom name, or choose [M] for Simulated Live Demo.[/dim]")
-            choice = self._safe_prompt("Select AWS Profile", default="1")
+            console.print("[dim]Select an existing profile number, type a custom name, [bold yellow][K][/bold yellow] for manual Keys, or choose [bold yellow][M][/bold yellow] for Simulated Live Demo.[/dim]")
+            choice = self._safe_prompt("Select AWS Profile (or [K] for manual keys)", default="1")
             
             if choice.upper() == "M":
                 return None, cli_region or "us-east-1", True
+
+            if choice.upper() == "K":
+                ak = self._safe_prompt("AWS Access Key ID")
+                sk = self._safe_prompt("AWS Secret Access Key", password=True)
+                region = self._safe_prompt("AWS Region", default=cli_region or "us-east-1")
+                session = boto3.Session(aws_access_key_id=ak, aws_secret_access_key=sk, region_name=region)
+                return session, region, False
 
             selected_profile = None
             if choice.isdigit() and 1 <= int(choice) <= len(profiles):
@@ -296,14 +310,40 @@ class LiveCloudFetcher:
         self,
         cli_context: Optional[str] = None,
         cli_namespace: Optional[str] = None,
-        is_demo: bool = False
+        is_demo: bool = False,
+        cli_eks_cluster: Optional[str] = None,
+        cli_k8s_endpoint: Optional[str] = None,
+        cli_k8s_token: Optional[str] = None,
+        cli_k8s_ca_cert: Optional[str] = None,
+        cli_k8s_insecure: bool = False,
+        aws_session: Optional[boto3.Session] = None
     ) -> Tuple[Optional[str], str]:
         """
-        Interactive wizard to select K8s context and namespace.
-        Returns: (context_name, namespace)
+        Interactive wizard or CLI resolver to select K8s cluster and namespace.
+        Supports AWS EKS (In-Memory STS), External K8s (Bearer Token), and Local Kubeconfig.
+        Returns: (context_name_or_identifier, namespace)
         """
         if is_demo:
             return "eks-prod-cluster-us-east-1", cli_namespace or "default"
+
+        if aws_session is not None:
+            self.k8s_conn_params["aws_session"] = aws_session
+
+        if cli_k8s_endpoint and cli_k8s_token:
+            self.k8s_conn_params = {
+                "k8s_endpoint": cli_k8s_endpoint,
+                "k8s_token": cli_k8s_token,
+                "k8s_ca_cert": cli_k8s_ca_cert,
+                "k8s_insecure": cli_k8s_insecure
+            }
+            return f"external:{cli_k8s_endpoint}", cli_namespace or "default"
+
+        if cli_eks_cluster:
+            self.k8s_conn_params = {
+                "cluster_name": cli_eks_cluster,
+                "aws_session": aws_session
+            }
+            return f"eks:{cli_eks_cluster}", cli_namespace or "default"
 
         if cli_context:
             return cli_context, cli_namespace or "default"
@@ -314,33 +354,77 @@ class LiveCloudFetcher:
 
         console.print("\n[bold cyan]═══ [2/2] Live Kubernetes Cluster Discovery ═══[/]")
 
-        if contexts:
-            table = Table(title="Available Kubernetes Cluster Contexts (~/.kube/config)", border_style="cyan")
-            table.add_column("#", style="bold green", width=4)
-            table.add_column("Context Name", style="bold white")
-            table.add_column("Status", style="yellow")
+        # Discover EKS clusters in AWS account if session is available
+        eks_clusters: List[str] = []
+        if aws_session is not None:
+            try:
+                eks_client = aws_session.client("eks")
+                eks_clusters = list(eks_client.list_clusters().get("clusters", []))
+            except Exception:
+                pass
 
-            default_idx = "1"
-            for i, ctx in enumerate(contexts, start=1):
-                status = "★ Active (current-context)" if ctx == current else "Available"
-                if ctx == current:
-                    default_idx = str(i)
-                table.add_row(str(i), ctx, status)
-            console.print(table)
+        options: List[Dict[str, Any]] = []
+        # 1. Discovered EKS clusters
+        for cl in eks_clusters:
+            options.append({
+                "type": "eks",
+                "label": f"AWS EKS: {cl} (In-Memory STS Presigned Token - Zero CLI)",
+                "val": cl
+            })
+        # 2. Local Kubeconfig contexts
+        for ctx in contexts:
+            status = "★ Active (current-context)" if ctx == current else "Available"
+            options.append({
+                "type": "kubeconfig",
+                "label": f"Kubeconfig Context: {ctx} ({status})",
+                "val": ctx
+            })
+        # 3. External cluster option
+        options.append({
+            "type": "external",
+            "label": "External Kubernetes Cluster (API Endpoint + Bearer Token)",
+            "val": "external"
+        })
 
-            choice = self._safe_prompt("Select Kubernetes Context", default=default_idx)
-            selected_ctx = None
-            if choice.isdigit() and 1 <= int(choice) <= len(contexts):
-                selected_ctx = contexts[int(choice) - 1]
-            else:
-                selected_ctx = choice
-
-            target_namespace = self._safe_prompt("Target Kubernetes Namespace (or 'all')", default=cli_namespace or "default")
-            return selected_ctx, target_namespace
-        else:
-            console.print("[dim]No local ~/.kube/config cluster contexts detected. Using connected cluster context or demo environment.[/dim]")
+        if not contexts and not eks_clusters:
+            console.print("[dim]No local ~/.kube/config cluster contexts or EKS clusters detected. Using connected cluster context or demo environment.[/dim]")
             target_namespace = cli_namespace or "default"
             return None, target_namespace
+
+        table = Table(title="Available Kubernetes Targets (EKS In-Memory / Kubeconfig / External)", border_style="cyan")
+        table.add_column("#", style="bold green", width=4)
+        table.add_column("Connection Target / Cluster", style="bold white")
+        table.add_column("Engine / Protocol", style="yellow")
+
+        for i, opt in enumerate(options, start=1):
+            proto = "In-Memory STS (Zero CLI)" if opt["type"] == "eks" else ("~/.kube/config" if opt["type"] == "kubeconfig" else "HTTP Bearer Token")
+            table.add_row(str(i), opt["label"], proto)
+        console.print(table)
+
+        choice = self._safe_prompt("Select Kubernetes Target", default="1")
+        selected_idx = int(choice) - 1 if (choice.isdigit() and 1 <= int(choice) <= len(options)) else 0
+        chosen_opt = options[selected_idx]
+
+        target_namespace = self._safe_prompt("Target Kubernetes Namespace (or 'all')", default=cli_namespace or "default")
+
+        if chosen_opt["type"] == "eks":
+            self.k8s_conn_params = {
+                "cluster_name": chosen_opt["val"],
+                "aws_session": aws_session
+            }
+            return f"eks:{chosen_opt['val']}", target_namespace
+        elif chosen_opt["type"] == "external":
+            endpoint = self._safe_prompt("Kubernetes API Server Endpoint (e.g. https://1.2.3.4:6443)")
+            token = self._safe_prompt("Bearer Token", password=True)
+            insecure = Confirm.ask("Skip SSL certificate verification?", default=True)
+            self.k8s_conn_params = {
+                "k8s_endpoint": endpoint,
+                "k8s_token": token,
+                "k8s_insecure": insecure
+            }
+            return f"external:{endpoint}", target_namespace
+        else:
+            return chosen_opt["val"], target_namespace
 
     # =========================================================================
     # Live AWS Ingestion Engine
@@ -733,30 +817,93 @@ class LiveCloudFetcher:
             return True
         return False
 
-    def fetch_k8s_live_assets(self, context_name: Optional[str] = None, namespace: str = "default"):
+    def fetch_k8s_live_assets(
+        self,
+        context_name: Optional[str] = None,
+        namespace: str = "default",
+        aws_session: Optional[boto3.Session] = None,
+        api_client: Optional[Any] = None,
+        k8s_endpoint: Optional[str] = None,
+        k8s_token: Optional[str] = None,
+        k8s_ca_cert: Optional[str] = None,
+        verify_ssl: bool = True
+    ):
         """Discovers running Workloads, ServiceAccounts, RBAC Roles, and NetworkPolicies from the target cluster."""
         self._log(f"\n[bold yellow]⚡ Ingesting Live Kubernetes Assets (Context: {context_name or 'default'}, Namespace: {namespace})...[/]")
 
-        if not self._has_k8s_configuration(context_name):
+        conn = getattr(self, "k8s_conn_params", {}) or {}
+        target_endpoint = k8s_endpoint or conn.get("k8s_endpoint")
+        target_token = k8s_token or conn.get("k8s_token")
+        target_ca = k8s_ca_cert or conn.get("k8s_ca_cert")
+        target_insecure = (not verify_ssl) or conn.get("k8s_insecure", False)
+        target_cluster = (
+            (context_name[4:] if context_name and context_name.startswith("eks:") else None)
+            or conn.get("cluster_name")
+        )
+        target_session = aws_session or conn.get("aws_session")
+
+        has_target_params = bool((target_endpoint and target_token) or (target_cluster and target_session) or api_client)
+
+        if not has_target_params and not self._has_k8s_configuration(context_name):
             self._warn("No Kubernetes configuration (~/.kube/config) or in-cluster token found; skipping live K8s scan.")
             return
 
         # Strategy A: Use official kubernetes client
         if HAS_K8S_CLIENT:
             try:
-                if context_name:
-                    k8s_config.load_kube_config(context=context_name)
-                else:
-                    try:
-                        k8s_config.load_incluster_config()
-                    except Exception:
-                        k8s_config.load_kube_config()
+                if api_client is None:
+                    # 1. External K8s (Endpoint + Bearer Token)
+                    if target_endpoint and target_token:
+                        api_client = K8sAuthEngine.auto_connect(
+                            k8s_endpoint=target_endpoint,
+                            k8s_token=target_token,
+                            k8s_ca_cert=target_ca,
+                            verify_ssl=not target_insecure
+                        )
+                        self._log(f"  [bold green]✔ In-Memory Bearer Token Authentication established to:[/] {target_endpoint}")
 
-                apps_v1 = k8s_client.AppsV1Api()
-                core_v1 = k8s_client.CoreV1Api()
-                rbac_v1 = k8s_client.RbacAuthorizationV1Api()
-                net_v1 = k8s_client.NetworkingV1Api()
-                batch_v1 = k8s_client.BatchV1Api()
+                    # 2. AWS EKS In-Memory via STS presigned URL
+                    elif target_cluster and target_session:
+                        api_client = K8sAuthEngine.auto_connect(
+                            aws_session=target_session,
+                            cluster_name=target_cluster
+                        )
+                        self._log(f"  [bold green]✔ In-Memory EKS STS Bearer Token generated for cluster:[/] {target_cluster}")
+
+                    # 3. Kubeconfig context auto-detect EKS or fallback
+                    elif context_name and ":cluster/" in context_name and target_session:
+                        extracted_cluster = context_name.split(":cluster/")[-1]
+                        try:
+                            api_client = K8sAuthEngine.auto_connect(
+                                aws_session=target_session,
+                                cluster_name=extracted_cluster
+                            )
+                            self._log(f"  [bold green]✔ Detected EKS context; auto-generated In-Memory token for:[/] {extracted_cluster}")
+                        except Exception as exc:
+                            self._warn(f"EKS in-memory token fallback failed: {exc}")
+
+                    # 4. Standard Kubeconfig or In-Cluster fallback
+                    if api_client is None:
+                        try:
+                            api_client = K8sAuthEngine.auto_connect(
+                                kube_context=context_name,
+                                use_kubeconfig=True
+                            )
+                        except Exception:
+                            if context_name:
+                                k8s_config.load_kube_config(context=context_name)
+                            else:
+                                try:
+                                    k8s_config.load_incluster_config()
+                                except Exception:
+                                    k8s_config.load_kube_config()
+
+                self.k8s_api_client = api_client
+                apps_v1 = k8s_client.AppsV1Api(api_client) if api_client else k8s_client.AppsV1Api()
+                core_v1 = k8s_client.CoreV1Api(api_client) if api_client else k8s_client.CoreV1Api()
+                rbac_v1 = k8s_client.RbacAuthorizationV1Api(api_client) if api_client else k8s_client.RbacAuthorizationV1Api()
+                net_v1 = k8s_client.NetworkingV1Api(api_client) if api_client else k8s_client.NetworkingV1Api()
+                batch_v1 = k8s_client.BatchV1Api(api_client) if api_client else k8s_client.BatchV1Api()
 
                 # 1. Namespaces (fast probe with short timeout; abort Strategy A immediately if unreachable)
                 try:
@@ -936,8 +1083,9 @@ class LiveCloudFetcher:
             except Exception as e:
                 self._warn(f"K8s Client API connection failed: {e}. Trying CLI fallback...")
 
-        # Strategy B: Fallback via `kubectl` JSON output
-        self._fetch_k8s_via_kubectl(context_name, namespace)
+        # Strategy B: Fallback via `kubectl` JSON output (only if context-based and not external/in-memory)
+        if not (target_endpoint and target_token) and not (target_cluster and target_session):
+            self._fetch_k8s_via_kubectl(context_name, namespace)
 
     def _run_kubectl_json_with_error(
         self,

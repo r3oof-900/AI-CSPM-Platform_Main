@@ -83,17 +83,21 @@ class AwsJsonParser:
             return
 
         json_files: List[str] = []
-        for root, dirs, files in os.walk(dir_path):
-            dirs[:] = [
-                d for d in sorted(dirs)
-                if not d.startswith(".") and "backup" not in d.lower()
-            ]
-            for fname in sorted(files):
-                if not fname.endswith(".json"):
-                    continue
-                if fname.endswith((".tfvars.json", ".backup")) or fname.startswith("remediated_"):
-                    continue
-                json_files.append(os.path.join(root, fname))
+        if os.path.isfile(dir_path):
+            if dir_path.endswith(".json") and not dir_path.endswith((".tfvars.json", ".backup")):
+                json_files.append(dir_path)
+        else:
+            for root, dirs, files in os.walk(dir_path):
+                dirs[:] = [
+                    d for d in sorted(dirs)
+                    if not d.startswith(".") and "backup" not in d.lower()
+                ]
+                for fname in sorted(files):
+                    if not fname.endswith(".json"):
+                        continue
+                    if fname.endswith((".tfvars.json", ".backup")) or fname.startswith("remediated_"):
+                        continue
+                    json_files.append(os.path.join(root, fname))
 
         for fp in json_files:
             self.parse_file(fp)

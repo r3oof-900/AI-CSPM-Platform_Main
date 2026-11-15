@@ -41,6 +41,7 @@ from rich.tree import Tree
 
 from core.graph import ContextualGraph
 from core.analyzer import AttackPathAnalyzer
+from core.models import AttackPath, MisconfigurationFinding, RemediationResult
 from ingestion.k8s_parser import K8sParser
 from ingestion.tf_parser import TerraformParser
 from ingestion.aws_json_parser import AwsJsonParser
@@ -72,17 +73,20 @@ def _verify_aws_credentials(session):
 
 
 def _resolve_aws_session(fetcher, aws_profile, aws_region):
-    """Uses the standard boto3 credential chain (env vars, SSO, instance role) when no
-    profile is given; falls back to the interactive wizard only if nothing is configured."""
+    """Uses explicit env vars (AWS_ACCESS_KEY_ID + AWS_SECRET_ACCESS_KEY) when present (e.g. CI/CD);
+    otherwise launches the interactive configuration wizard so the user can choose a profile,
+    enter manual keys, or select demo mode."""
     if not aws_profile:
-        try:
-            import boto3
-            region = aws_region or os.environ.get("AWS_DEFAULT_REGION") or os.environ.get("AWS_REGION") or "us-east-1"
-            sess = boto3.Session(region_name=region)
-            if sess.get_credentials() is not None:
-                return sess, region, False
-        except Exception:
-            pass
+        has_env_keys = bool(os.environ.get("AWS_ACCESS_KEY_ID") and os.environ.get("AWS_SECRET_ACCESS_KEY"))
+        if has_env_keys:
+            try:
+                import boto3
+                region = aws_region or os.environ.get("AWS_DEFAULT_REGION") or os.environ.get("AWS_REGION") or "us-east-1"
+                sess = boto3.Session(region_name=region)
+                if sess.get_credentials() is not None:
+                    return sess, region, False
+            except Exception:
+                pass
     return fetcher.prompt_aws_configuration(cli_profile=aws_profile, cli_region=aws_region)
 
 
@@ -100,11 +104,21 @@ def run_scan(
     aws_region: Optional[str] = None,
     kube_context: Optional[str] = None,
     k8s_namespace: Optional[str] = None,
-    fail_on: str = "critical"
+    fail_on: str = "critical",
+    eks_cluster: Optional[str] = None,
+    k8s_endpoint: Optional[str] = None,
+    k8s_token: Optional[str] = None,
+    k8s_ca_cert: Optional[str] = None,
+    k8s_insecure: bool = False
 ) -> int:
     cg = ContextualGraph()
     source_description = ""
     parse_warnings = []
+    is_aicspm_snapshot = False
+    loaded_snapshot_data = None
+    aws_json = None
+    tf = None
+    k8s = None
 
     # =========================================================================
     # INGESTION: LIVE CLOUD RUNTIME vs STATIC IAC MANIFESTS
@@ -133,7 +147,13 @@ def run_scan(
             k8s_ctx, k8s_ns = fetcher.prompt_k8s_configuration(
                 cli_context=kube_context,
                 cli_namespace=k8s_namespace,
-                is_demo=is_demo
+                is_demo=is_demo,
+                cli_eks_cluster=eks_cluster,
+                cli_k8s_endpoint=k8s_endpoint,
+                cli_k8s_token=k8s_token,
+                cli_k8s_ca_cert=k8s_ca_cert,
+                cli_k8s_insecure=k8s_insecure,
+                aws_session=session
             )
 
             if is_demo:
@@ -150,7 +170,7 @@ def run_scan(
                     for w in list(getattr(fetcher, "warnings", []))[:10]:
                         err_console.print(f"  [yellow]⚠ {w}[/]")
                     return 2
-                source_description = f"Live AWS ({region}) & K8s Context ({k8s_ctx or 'active'}:{k8s_ns})"
+                source_description = f"Live AWS ({region}) & K8s ({k8s_ctx or 'active'}:{k8s_ns})"
 
         if format_type == "console":
             console.print("\n→ [yellow]Synthesizing Contextual Directed Acyclic Graph (DAG) across live layers...[/]")
@@ -179,55 +199,97 @@ def run_scan(
             print_banner()
             console.print(f"\n🔍 [bold cyan]Initiating Multi-Tier Contextual Scan on Target:[/] \n[dim]{target_dir}[/]\n")
 
-        # 1. Parse Ingestion
-        if format_type == "console":
-            console.print("→ [yellow]Parsing Kubernetes manifests & IRSA bindings...[/]")
-        k8s = K8sParser()
-        for root, dirs, files in os.walk(target_dir):
-            for f in files:
-                if f.endswith((".yaml", ".yml")):
-                    k8s.parse_file(os.path.join(root, f))
+        # Check for AI-CSPM native offline snapshot / report JSON
+        is_aicspm_snapshot = False
+        loaded_snapshot_data = None
+        aws_json = None
+        tf = None
+        k8s = None
+        if os.path.isfile(target_dir) and target_dir.endswith(".json"):
+            try:
+                with open(target_dir, "r", encoding="utf-8") as f:
+                    candidate = json.load(f)
+                if isinstance(candidate, dict) and ("graph_summary" in candidate or candidate.get("tool") == "AI-CSPM Standalone CLI"):
+                    is_aicspm_snapshot = True
+                    loaded_snapshot_data = candidate
+            except Exception:
+                pass
 
-        if format_type == "console":
-            console.print("→ [yellow]Parsing Terraform Infrastructure-as-Code (HCL) & exported AWS JSON snapshots...[/]")
-        tf = TerraformParser()
-        tf.parse_directory(target_dir)
+        if is_aicspm_snapshot and loaded_snapshot_data:
+            if format_type == "console":
+                console.print(f"→ [bold green]Ingesting AI-CSPM Contextual Snapshot Graph:[/] [cyan]{os.path.basename(target_dir)}[/]")
+            for n in loaded_snapshot_data.get("graph_summary", {}).get("nodes", []):
+                cg.graph.add_node(
+                    n["id"],
+                    name=n.get("label", n["id"]),
+                    label=n.get("label", n["id"]),
+                    node_type=n.get("type", "UNKNOWN"),
+                    layer=n.get("layer", "Unknown"),
+                    source_file=n.get("source_file", "")
+                )
+            for e in loaded_snapshot_data.get("graph_summary", {}).get("edges", []):
+                cg.graph.add_edge(
+                    e["source"],
+                    e["target"],
+                    edge_type=e.get("type", ""),
+                    is_wildcard=e.get("is_wildcard", False),
+                    lethal_flaw=e.get("lethal_flaw", False)
+                )
+            analyzer = AttackPathAnalyzer(cg, tf_parser=None, k8s_parser=None)
+        else:
+            # 1. Parse Ingestion
+            if format_type == "console":
+                console.print("→ [yellow]Parsing Kubernetes manifests & IRSA bindings...[/]")
+            k8s = K8sParser()
+            if os.path.isfile(target_dir):
+                if target_dir.endswith((".yaml", ".yml")):
+                    k8s.parse_file(target_dir)
+            else:
+                for root, dirs, files in os.walk(target_dir):
+                    for f in files:
+                        if f.endswith((".yaml", ".yml")):
+                            k8s.parse_file(os.path.join(root, f))
 
-        aws_json = AwsJsonParser()
-        aws_json.parse_directory(target_dir)
+            if format_type == "console":
+                console.print("→ [yellow]Parsing Terraform Infrastructure-as-Code (HCL) & exported AWS JSON snapshots...[/]")
+            tf = TerraformParser()
+            tf.parse_directory(target_dir)
 
-        def _merge_nodes(primary, extra):
-            seen = {n.id for n in primary}
-            return list(primary) + [n for n in extra if n.id not in seen]
+            aws_json = AwsJsonParser()
+            aws_json.parse_directory(target_dir)
 
-        merged_roles = _merge_nodes(tf.roles, aws_json.roles)
-        merged_policies = _merge_nodes(tf.policies, aws_json.policies)
-        merged_kms = _merge_nodes(tf.kms_keys, aws_json.kms_keys)
-        merged_buckets = _merge_nodes(tf.s3_buckets, aws_json.s3_buckets)
-        merged_attachments = list(tf.attachments)
-        seen_att = {(a.get("role"), a.get("policy")) for a in merged_attachments}
-        for att in aws_json.attachments:
-            pair = (att.get("role"), att.get("policy"))
-            if pair not in seen_att:
-                seen_att.add(pair)
-                merged_attachments.append(att)
+            def _merge_nodes(primary, extra):
+                seen = {n.id for n in primary}
+                return list(primary) + [n for n in extra if n.id not in seen]
 
-        # 2. Build Contextual Directed Acyclic Graph (DAG)
-        if format_type == "console":
-            console.print("→ [yellow]Synthesizing Contextual Directed Acyclic Graph (DAG) across layers...[/]")
+            merged_roles = _merge_nodes(tf.roles, aws_json.roles)
+            merged_policies = _merge_nodes(tf.policies, aws_json.policies)
+            merged_kms = _merge_nodes(tf.kms_keys, aws_json.kms_keys)
+            merged_buckets = _merge_nodes(tf.s3_buckets, aws_json.s3_buckets)
+            merged_attachments = list(tf.attachments)
+            seen_att = {(a.get("role"), a.get("policy")) for a in merged_attachments}
+            for att in aws_json.attachments:
+                pair = (att.get("role"), att.get("policy"))
+                if pair not in seen_att:
+                    seen_att.add(pair)
+                    merged_attachments.append(att)
 
-        cg.build_from_parsed(
-            workloads=k8s.workloads,
-            service_accounts=k8s.service_accounts,
-            roles=merged_roles,
-            policies=merged_policies,
-            kms_keys=merged_kms,
-            s3_buckets=merged_buckets,
-            attachments=merged_attachments
-        )
-        analyzer = AttackPathAnalyzer(cg, tf_parser=tf, k8s_parser=k8s)
-        parse_warnings.extend(getattr(tf, "parse_warnings", []))
-        parse_warnings.extend(getattr(aws_json, "parse_warnings", []))
+            # 2. Build Contextual Directed Acyclic Graph (DAG)
+            if format_type == "console":
+                console.print("→ [yellow]Synthesizing Contextual Directed Acyclic Graph (DAG) across layers...[/]")
+
+            cg.build_from_parsed(
+                workloads=k8s.workloads,
+                service_accounts=k8s.service_accounts,
+                roles=merged_roles,
+                policies=merged_policies,
+                kms_keys=merged_kms,
+                s3_buckets=merged_buckets,
+                attachments=merged_attachments
+            )
+            analyzer = AttackPathAnalyzer(cg, tf_parser=tf, k8s_parser=k8s)
+            parse_warnings.extend(getattr(tf, "parse_warnings", []))
+            parse_warnings.extend(getattr(aws_json, "parse_warnings", []))
 
     if format_type == "console" and parse_warnings:
         for pw in parse_warnings:
@@ -259,8 +321,32 @@ def run_scan(
         console.print("")
 
     # 4. Cross-Layer Compromise Chain Traversal & Remediation Synthesis
-    attack_paths = analyzer.find_cross_layer_attack_paths()
-    misconfigs = analyzer.audit_all_misconfigurations(attack_paths=attack_paths)
+    if is_aicspm_snapshot and loaded_snapshot_data:
+        attack_paths = []
+        for ap in loaded_snapshot_data.get("attack_paths", []):
+            try:
+                attack_paths.append(AttackPath(**ap))
+            except Exception:
+                pass
+        misconfigs = []
+        for m in loaded_snapshot_data.get("misconfigurations", []):
+            try:
+                misconfigs.append(MisconfigurationFinding(**m))
+            except Exception:
+                pass
+        remediations = []
+        for r in loaded_snapshot_data.get("remediations", []):
+            try:
+                remediations.append(RemediationResult(**r))
+            except Exception:
+                pass
+        remediation = remediations[0] if remediations else None
+        remediation_providers = loaded_snapshot_data.get("ai_diagnostics", {}).get("remediation_providers", [])
+        ai_warnings = loaded_snapshot_data.get("ai_diagnostics", {}).get("warnings", [])
+        remediation_warnings = []
+    else:
+        attack_paths = analyzer.find_cross_layer_attack_paths()
+        misconfigs = analyzer.audit_all_misconfigurations(attack_paths=attack_paths)
 
     severity_counts = {"CRITICAL": 0, "HIGH": 0, "MEDIUM": 0, "LOW": 0, "INFO": 0}
     for m in misconfigs:
@@ -287,21 +373,35 @@ def run_scan(
     )
     posture_pct = max(0, 100 - min(100, penalty))
 
-    ai_engine = AIRemediationEngine(offline_mode=offline_mode)
-    remediations = []
-    remediation_providers = []
-    remediation_warnings = []
-    ai_warnings = []
-    for ap in attack_paths:
-        rem = ai_engine.synthesize_remediation(ap, offline_mode=offline_mode)
-        remediations.append(rem)
-        if ai_engine.last_provider not in remediation_providers:
-            remediation_providers.append(ai_engine.last_provider)
-        if ai_engine.last_error:
-            msg = f"Remediation ({ap.id}): {ai_engine.last_error}"
-            remediation_warnings.append(msg)
-            ai_warnings.append(msg)
-    remediation = remediations[0] if remediations else None
+    if is_aicspm_snapshot and loaded_snapshot_data and "metrics" in loaded_snapshot_data:
+        m_data = loaded_snapshot_data["metrics"]
+        if "containment_score" in m_data:
+            try:
+                containment_pct = int(str(m_data["containment_score"]).replace("%", ""))
+            except Exception:
+                pass
+        if "posture_score" in m_data:
+            try:
+                posture_pct = int(str(m_data["posture_score"]).replace("%", ""))
+            except Exception:
+                pass
+
+    if not (is_aicspm_snapshot and remediations):
+        ai_engine = AIRemediationEngine(offline_mode=offline_mode)
+        remediations = []
+        remediation_providers = []
+        remediation_warnings = []
+        ai_warnings = []
+        for ap in attack_paths:
+            rem = ai_engine.synthesize_remediation(ap, offline_mode=offline_mode)
+            remediations.append(rem)
+            if ai_engine.last_provider not in remediation_providers:
+                remediation_providers.append(ai_engine.last_provider)
+            if ai_engine.last_error:
+                msg = f"Remediation ({ap.id}): {ai_engine.last_error}"
+                remediation_warnings.append(msg)
+                ai_warnings.append(msg)
+        remediation = remediations[0] if remediations else None
 
     if format_type == "console":
         console.print("⚡ [bold cyan]Traversing Graph for Cross-Layer Compromise Chains...[/]")
@@ -418,25 +518,29 @@ def run_scan(
         )
 
     # 6. Multi-Agent Consensus Deliberation
-    consensus_engine = MultiAgentConsensusEngine(offline_mode=offline_mode)
-    path_payload = attack_paths[0].model_dump() if attack_paths else {
-        "id": "AP-CONTAINED",
-        "title": "Hardened Baseline Verification",
-        "source_node": "remediated-workload",
-        "destination": "isolated-storage"
-    }
-    path_payload["total_misconfigs"] = len(misconfigs)
-    path_payload["severity_counts"] = severity_counts
-    path_payload["max_misconfig_cvss"] = max_misconfig_cvss
-    path_payload["all_attack_paths"] = [
-        {"id": ap.id, "title": ap.title, "severity": ap.severity.value, "root_cause": ap.root_cause}
-        for ap in attack_paths
-    ]
+    if is_aicspm_snapshot and loaded_snapshot_data and loaded_snapshot_data.get("consensus"):
+        consensus_data = loaded_snapshot_data["consensus"]
+        consensus_warn = None
+    else:
+        consensus_engine = MultiAgentConsensusEngine(offline_mode=offline_mode)
+        path_payload = attack_paths[0].model_dump() if attack_paths else {
+            "id": "AP-CONTAINED",
+            "title": "Hardened Baseline Verification",
+            "source_node": "remediated-workload",
+            "destination": "isolated-storage"
+        }
+        path_payload["total_misconfigs"] = len(misconfigs)
+        path_payload["severity_counts"] = severity_counts
+        path_payload["max_misconfig_cvss"] = max_misconfig_cvss
+        path_payload["all_attack_paths"] = [
+            {"id": ap.id, "title": ap.title, "severity": ap.severity.value, "root_cause": ap.root_cause}
+            for ap in attack_paths
+        ]
 
-    consensus_data = consensus_engine.run_consensus_evaluation(path_payload, offline_mode=offline_mode)
-    consensus_warn = consensus_data.get("fallback_reason")
-    if consensus_warn:
-        ai_warnings.append(f"Consensus: {consensus_warn}")
+        consensus_data = consensus_engine.run_consensus_evaluation(path_payload, offline_mode=offline_mode)
+        consensus_warn = consensus_data.get("fallback_reason")
+        if consensus_warn:
+            ai_warnings.append(f"Consensus: {consensus_warn}")
 
     def _safe_float(raw: Any, default: float = 0.0) -> float:
         try:
@@ -546,8 +650,9 @@ def run_scan(
                 patch_file = apply_auto_remediation(target_dir, rem, attack_path=ap)
                 if patch_file and patch_file not in patched_files:
                     patched_files.append(patch_file)
-            if not patched_files and aws_json.roles:
-                snap_patch = os.path.join(target_dir, "remediated_snapshot_least_privilege.tf")
+            if not patched_files and ((aws_json and getattr(aws_json, "roles", None)) or is_aicspm_snapshot):
+                patch_dir = os.path.dirname(target_dir) if os.path.isfile(target_dir) else target_dir
+                snap_patch = os.path.join(patch_dir, "remediated_snapshot_least_privilege.tf")
                 with open(snap_patch, "w", encoding="utf-8") as f:
                     f.write("\n\n".join(r.remediated_code for r in remediations))
                 patched_files.append(snap_patch)
@@ -657,6 +762,27 @@ Examples:
         help="Target Kubernetes namespace to scan (default: default, or 'all')"
     )
     parser.add_argument(
+        "--eks-cluster",
+        help="AWS EKS cluster name to authenticate in-memory via STS presigned URL (Zero-CLI)"
+    )
+    parser.add_argument(
+        "--k8s-endpoint",
+        help="External Kubernetes API server endpoint (e.g. https://192.168.1.50:6443)"
+    )
+    parser.add_argument(
+        "--k8s-token",
+        help="Bearer Token for external Kubernetes cluster"
+    )
+    parser.add_argument(
+        "--k8s-ca-cert",
+        help="Base64-encoded CA certificate for external Kubernetes cluster"
+    )
+    parser.add_argument(
+        "--k8s-insecure",
+        action="store_true",
+        help="Disable SSL/TLS certificate verification for external Kubernetes cluster"
+    )
+    parser.add_argument(
         "--output",
         "-o",
         help="Path to output JSON report file"
@@ -720,7 +846,12 @@ Examples:
         aws_region=args.aws_region,
         kube_context=args.kube_context,
         k8s_namespace=args.k8s_namespace,
-        fail_on=args.fail_on
+        fail_on=args.fail_on,
+        eks_cluster=args.eks_cluster,
+        k8s_endpoint=args.k8s_endpoint,
+        k8s_token=args.k8s_token,
+        k8s_ca_cert=args.k8s_ca_cert,
+        k8s_insecure=args.k8s_insecure
     )
     sys.exit(exit_code)
 

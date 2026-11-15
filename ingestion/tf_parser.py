@@ -139,7 +139,7 @@ class TerraformParser:
         return resolved
 
     def parse_directory(self, dir_path: str):
-        """Scans all .tf, .tfvars, and .json files in the specified directory."""
+        """Scans all .tf, .tfvars, and .json files in the specified directory or single file."""
         if not os.path.exists(dir_path):
             return
 
@@ -147,16 +147,24 @@ class TerraformParser:
         all_tfvars_files = []
         all_json_files = []
 
-        for root, dirs, files in os.walk(dir_path):
-            dirs[:] = [d for d in dirs if not d.startswith(".") and "backup" not in d.lower()]
-            for file in files:
-                full_path = os.path.join(root, file)
-                if file.endswith(".tf"):
-                    all_tf_files.append(full_path)
-                elif file.endswith(".tfvars") or file.endswith(".tfvars.json"):
-                    all_tfvars_files.append(full_path)
-                elif file.endswith(".json") and "policy" in file.lower():
-                    all_json_files.append(full_path)
+        if os.path.isfile(dir_path):
+            if dir_path.endswith(".tf"):
+                all_tf_files.append(dir_path)
+            elif dir_path.endswith(".tfvars") or dir_path.endswith(".tfvars.json"):
+                all_tfvars_files.append(dir_path)
+            elif dir_path.endswith(".json") and "policy" in dir_path.lower():
+                all_json_files.append(dir_path)
+        else:
+            for root, dirs, files in os.walk(dir_path):
+                dirs[:] = [d for d in dirs if not d.startswith(".") and "backup" not in d.lower()]
+                for file in files:
+                    full_path = os.path.join(root, file)
+                    if file.endswith(".tf"):
+                        all_tf_files.append(full_path)
+                    elif file.endswith(".tfvars") or file.endswith(".tfvars.json"):
+                        all_tfvars_files.append(full_path)
+                    elif file.endswith(".json") and "policy" in file.lower():
+                        all_json_files.append(full_path)
 
         # 1. Parse variables, locals, providers, and data policy documents first
         for tf_path in all_tf_files:
