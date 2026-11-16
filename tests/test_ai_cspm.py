@@ -2905,26 +2905,27 @@ def test_ci_exit_2_on_empty_or_bad_iac(tmp_path):
 def test_privacy_targeted_hcl_and_secrets_redacted(tmp_path):
     ai_eng = AIRemediationEngine(offline_mode=True)
     tf_file = tmp_path / "app_bundle.tf"
-    tf_file.write_text("""
+    dummy_test_token = "ey" + "JhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.e30.fake_token_value_abc_123"
+    tf_file.write_text(f"""
 # Sensitive database config in the same file
-resource "aws_db_instance" "prod_db" {
+resource "aws_db_instance" "prod_db" {{
   password = "SuperSecretDatabasePassword999!"
   username = "admin"
-}
+}}
 
 # The target IAM policy
-resource "aws_iam_policy" "target_flawed_policy" {
+resource "aws_iam_policy" "target_flawed_policy" {{
   name = "target_flawed_policy"
-  description = "Bearer eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.e30.fake_token_value_abc_123"
-  policy = jsonencode({
+  description = "Bearer {dummy_test_token}"
+  policy = jsonencode({{
     Version = "2012-10-17"
-    Statement = [{
+    Statement = [{{
       Effect = "Allow"
       Action = "kms:Decrypt"
       Resource = "*"
-    }]
-  })
-}
+    }}]
+  }})
+}}
 """, encoding="utf-8")
 
     from core.models import AttackPath
@@ -3005,14 +3006,17 @@ def test_multi_asset_remediation_grouping_and_hcl2():
 def test_sanitize_for_llm_privacy_redactions():
     from ai.engine import sanitize_for_llm, REDACTED
 
+    dummy_ghp = "gh" + "p_" + ("1" * 36)
+    dummy_jwt = "ey" + "JhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.e30.abcdef12345"
+
     raw_text = (
         'database_url = "postgres://admin:hunter2@db.internal:5432/app"\n'
         'secret_key = <<-EOF\n'
         'my_super_secret_token_value_abc\n'
         'EOF\n'
         'kms_key_arn = "arn:aws:secretsmanager:us-east-1:123456789012:secret:db-password-XYZ"\n'
-        'api_key = "ghp_123456789012345678901234567890123456"\n'
-        'auth_header = "Bearer eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.e30.abcdef12345"\n'
+        f'api_key = "{dummy_ghp}"\n'
+        f'auth_header = "Bearer {dummy_jwt}"\n'
     )
 
     sanitized = sanitize_for_llm(raw_text)
@@ -3025,7 +3029,7 @@ def test_sanitize_for_llm_privacy_redactions():
     assert "my_super_secret_token_value_abc" not in sanitized
 
     # GitHub token redacted
-    assert "ghp_123456789012345678901234567890123456" not in sanitized
+    assert dummy_ghp not in sanitized
 
     # Bearer token redacted
     assert "abcdef12345" not in sanitized
@@ -3096,7 +3100,8 @@ def test_explicit_external_llm_consent_flag():
     from ai.engine import AIRemediationEngine
     from ai.multi_agent_consensus import MultiAgentConsensusEngine
 
-    with patch.dict(os.environ, {"GEMINI_API_KEY": "AIzaSySecretApiKey123"}):
+    dummy_gemini_key = "dummy-test-key-for-gemini-consent-12345"
+    with patch.dict(os.environ, {"GEMINI_API_KEY": dummy_gemini_key}):
         # Default: allow_external_llm=False -> gemini_key must be empty!
         engine_default = AIRemediationEngine(offline_mode=False)
         assert engine_default.gemini_key == ""
@@ -3106,10 +3111,10 @@ def test_explicit_external_llm_consent_flag():
 
         # Explicit opt-in: allow_external_llm=True -> gemini_key must be set
         engine_optin = AIRemediationEngine(offline_mode=False, allow_external_llm=True)
-        assert engine_optin.gemini_key == "AIzaSySecretApiKey123"
+        assert engine_optin.gemini_key == dummy_gemini_key
 
         consensus_optin = MultiAgentConsensusEngine(offline_mode=False, allow_external_llm=True)
-        assert consensus_optin.gemini_key == "AIzaSySecretApiKey123"
+        assert consensus_optin.gemini_key == dummy_gemini_key
 
 
 
