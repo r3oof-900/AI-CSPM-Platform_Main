@@ -413,6 +413,7 @@ class AttackPath(BaseModel):
     impact: str
     affected_workloads: List[str] = Field(default_factory=list)
     exposed_assets: List[str] = Field(default_factory=list)
+    group_members: List[List[Dict[str, Any]]] = Field(default_factory=list, exclude=True)
     false_negative_tools: List[str] = Field(
         default_factory=lambda: [
             "Single-layer IAM policy scanners (lack K8s OIDC correlation)",

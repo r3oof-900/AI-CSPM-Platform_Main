@@ -31,9 +31,10 @@ except (ImportError, ValueError):
 
 
 class MultiAgentConsensusEngine:
-    def __init__(self, api_key: Optional[str] = None, offline_mode: bool = False):
+    def __init__(self, api_key: Optional[str] = None, offline_mode: bool = False, allow_external_llm: bool = False):
         self.offline_mode = offline_mode
-        self.gemini_key = "" if offline_mode else (api_key or load_env_secret("GEMINI_API_KEY"))
+        self.allow_external_llm = allow_external_llm
+        self.gemini_key = "" if (offline_mode or not allow_external_llm) else (api_key or load_env_secret("GEMINI_API_KEY"))
         self.model_name, self.timeout = load_gemini_config()
         self.api_endpoint = f"https://generativelanguage.googleapis.com/v1beta/models/{self.model_name}:generateContent"
         self.last_error: Optional[str] = None

@@ -119,9 +119,9 @@ class K8sParser:
                 base_w_id = f"k8s:workload:{namespace}:{name}"
                 existing_w_ids = {w.id for w in self.workloads} | {w.id for w in file_workloads}
                 if base_w_id in existing_w_ids:
-                    w_id = f"k8s:workload:{kind.lower()}:{namespace}:{name}"
+                    w_id = f"k8s:workload:{namespace}:{kind.lower()}:{name}"
                     if w_id in existing_w_ids:
-                        w_id = f"k8s:workload:{kind.lower()}:{namespace}:{name}:{len(existing_w_ids)}"
+                        w_id = f"k8s:workload:{namespace}:{kind.lower()}:{name}:{len(existing_w_ids)}"
                 else:
                     w_id = base_w_id
 

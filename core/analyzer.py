@@ -220,6 +220,15 @@ class AttackPathAnalyzer:
             rep.id = f"AP-{final_idx:03d}"
             rep.affected_workloads = affected_w
             rep.exposed_assets = exposed_a
+            seen_members = set()
+            members: List[List[Dict[str, Any]]] = []
+            for p_ in paths:
+                sig = tuple(sorted((n["type"], n["name"]) for n in p_.nodes
+                                   if n["type"] in (NodeType.KMS_KEY.value, NodeType.S3_BUCKET.value)))
+                if sig not in seen_members:
+                    seen_members.add(sig)
+                    members.append(p_.nodes)
+            rep.group_members = members
             if len(affected_w) > 1 or len(exposed_a) > 1:
                 base_title = "Multi-Tier Storage Exfiltration" if "STORAGE" in rep.title.upper() or "S3" in rep.title.upper() else "Multi-Tier Cryptographic Exfiltration"
                 rep.title = f"{base_title} ({len(affected_w)} Workloads -> {len(exposed_a)} Assets): {rep.nodes[0]['name']} -> {rep.nodes[-1]['name']}"

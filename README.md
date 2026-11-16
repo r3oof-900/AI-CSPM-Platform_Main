@@ -19,20 +19,22 @@ python ai_cspm.py --target samples/vulnerable_baseline --offline
 python ai_cspm.py --target samples/vulnerable_baseline --html report.html --graph graph.html
 python ai_cspm.py --live-demo --offline
 python ai_cspm.py --live --aws-profile prod --fail-on high
+# Live LLM remediation requires explicit consent and API key:
+python ai_cspm.py --target samples/vulnerable_baseline --allow-external-llm
 ```
 
 ## Configuration
 | Variable | Purpose | Default |
 |---|---|---|
-| `GEMINI_API_KEY` | Enables live LLM remediation | unset = offline engine |
+| `GEMINI_API_KEY` | API key for optional live LLM remediation | unset = offline engine |
 | `GEMINI_MODEL` | Gemini model name | `gemini-flash-lite-latest` |
 | `GEMINI_TIMEOUT` | HTTP timeout (seconds) | `25` |
 
 Real environment variables take precedence over `.env`. `.env` is read only from the
 current directory or the project root.
 
-## Security notes
+## Security & Privacy Notes
 - **Never commit `.env`.** It is git-ignored; CI and pre-commit run gitleaks.
-- With a Gemini key set, IaC snippets (resource names, ARNs) are sent to Google.
-  Use `--offline` to guarantee nothing leaves your machine.
+- **External LLM Consent (`--allow-external-llm`):** By default, AI-CSPM runs in 100% deterministic local offline mode. Sending prompts to Google Gemini requires **both** `GEMINI_API_KEY` and the explicit `--allow-external-llm` CLI flag.
+- **Strict Privacy & Targeted Masking:** When external LLM is enabled, AI-CSPM extracts *only* the specific affected resource block (file contents and unrelated resources are withheld). All sensitive tokens, passwords, database connection strings, access keys (`AKIA...`), GitHub PATs, and private keys are scrubbed and replaced with `[REDACTED_BY_AI_CSPM]` before transmission.
 - Review any `--apply-fix` patch before applying it.

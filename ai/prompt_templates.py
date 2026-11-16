@@ -160,7 +160,32 @@ def extract_target_refs(nodes: list) -> Tuple[str, str, str, str, bool]:
     return workload_name, policy_name, key_name, bucket_name, is_live
 
 
-def build_scoped_kms_policy_hcl(nodes: list) -> str:
+def _pair_from_nodes(member_nodes: list) -> Dict[str, Any]:
+    pair: Dict[str, Any] = {"key_name": "", "key_arn": None, "bucket_name": "", "bucket_arn": None}
+    for n in member_nodes or []:
+        ntype = str(n.get("type", ""))
+        if ntype in ("KMS_KEY", "NodeType.KMS_KEY"):
+            pair["key_name"] = n.get("name") or pair["key_name"]
+            pair["key_arn"] = n.get("key_arn") or pair["key_arn"]
+        elif ntype in ("S3_BUCKET", "NodeType.S3_BUCKET"):
+            pair["bucket_name"] = n.get("name") or pair["bucket_name"]
+            pair["bucket_arn"] = n.get("bucket_arn") or pair["bucket_arn"]
+    return pair
+
+
+def collect_group_pairs(nodes: list, group_members: Optional[list]) -> list:
+    members = group_members if group_members else [nodes]
+    seen, pairs = set(), []
+    for m in members:
+        pair = _pair_from_nodes(m)
+        sig = (pair["key_name"], pair["bucket_name"])
+        if sig not in seen:
+            seen.add(sig)
+            pairs.append(pair)
+    return pairs
+
+
+def build_scoped_kms_policy_hcl(nodes: list, group_members: Optional[list] = None) -> str:
     """Builds a valid scoped least-privilege Terraform HCL block matching the path's vector type."""
     vector_type = detect_attack_path_vector(nodes)
     _, policy_name, key_name, bucket_name, is_live = extract_target_refs(nodes)
@@ -287,7 +312,7 @@ resource "aws_s3_bucket_policy" "scoped_{bucket_tf_ident}_policy" {{
 
     remediated_policy_name = policy_name.replace("Overprivileged", "Scoped")
     if remediated_policy_name == policy_name and not remediated_policy_name.startswith("Scoped"):
-        remediated_policy_name = f"Scoped{policy_name}"
+        remediated_policy_name = f"Scoped-{policy_name}"
 
     role_tf_ident = _sanitize_tf_ident(role_name, "role")
     role_ref_val = (
@@ -295,6 +320,63 @@ resource "aws_s3_bucket_policy" "scoped_{bucket_tf_ident}_policy" {{
         if (use_explicit_arns and role_arn)
         else (f'"{role_name}"' if use_explicit_arns else f"aws_iam_role.{role_tf_ident}.name")
     )
+
+    pairs = collect_group_pairs(nodes, group_members)
+    if len(pairs) > 1 and vector_type in ("iam_policy", "s3_identity_policy"):
+        clean_policy_res = f"{clean_policy_res}_{role_tf_ident}"   # اسم فريد لكل دور
+        policy_attach = (
+            f'\n\nresource "aws_iam_role_policy_attachment" "{clean_policy_res}_attach" {{\n'
+            f'  role       = {role_ref_val}\n'
+            f'  policy_arn = aws_iam_policy.{clean_policy_res}.arn\n}}'
+        )
+
+        def _bucket_arn_expr(pr):
+            ident = _sanitize_tf_ident(pr["bucket_name"], "target_vault")
+            if use_explicit_arns:
+                arn = pr["bucket_arn"] or f"arn:aws:s3:::{pr['bucket_name']}"
+                return f'"{arn}"', f'"{arn}/*"'
+            return f"aws_s3_bucket.{ident}.arn", f'"${{aws_s3_bucket.{ident}.arn}}/*"'
+
+        stmts = []
+        if vector_type == "s3_identity_policy":
+            res_items = []
+            for pr in pairs:
+                a, b = _bucket_arn_expr(pr)
+                res_items += [a, b]
+            acts = next((n.get("allowed_actions") for n in (nodes or []) if n.get("allowed_actions")), None)
+            body = ",\n          ".join(res_items)
+            stmts.append(
+                '      {\n        Sid    = "ScopedStorageAccessOnly"\n        Effect = "Allow"\n'
+                f'        Action   = {json.dumps(acts or ["s3:GetObject"])}\n'
+                f'        Resource = [\n          {body}\n        ]\n      }}'
+            )
+            desc = f"Strictly scoped to {len(pairs)} authorized S3 storage buckets"
+        else:
+            for i, pr in enumerate(pairs, 1):
+                kid = _sanitize_tf_ident(str(pr["key_name"]).split("/")[-1], "target_cmk")
+                if use_explicit_arns and pr["key_arn"]:
+                    key_expr = f'"{pr["key_arn"]}"'
+                elif use_explicit_arns and str(pr["key_name"]).startswith("arn:"):
+                    key_expr = f'"{pr["key_name"]}"'
+                else:
+                    key_expr = f"aws_kms_key.{kid}.arn"
+                a, b = _bucket_arn_expr(pr)
+                stmts.append(
+                    f'      {{\n        Sid    = "ScopedKeyDecryption{i}"\n        Effect = "Allow"\n'
+                    '        Action = [\n          "kms:Decrypt",\n          "kms:DescribeKey"\n        ]\n'
+                    f'        Resource = {key_expr}\n'
+                    '        Condition = {\n          StringLike = {\n            "kms:EncryptionContext:aws:s3:arn" = [\n'
+                    f'              {a},\n              {b}\n            ]\n          }}\n        }}\n      }}'
+                )
+            desc = f"Strictly scoped to {len(pairs)} explicit CMK/S3 vault pairs with S3 EncryptionContext constraint"
+        stmts_txt = ",\n".join(stmts)
+        return (
+            f'resource "aws_iam_policy" "{clean_policy_res}" {{\n'
+            f'  name        = "{remediated_policy_name}"\n'
+            f'  description = "Remediated by AI-CSPM: {desc}"\n\n'
+            '  policy = jsonencode({\n    Version = "2012-10-17"\n    Statement = [\n'
+            f'{stmts_txt}\n    ]\n  }})\n}}' + policy_attach
+        )
 
     if vector_type == "s3_identity_policy":
         if use_explicit_arns and bucket_arn:

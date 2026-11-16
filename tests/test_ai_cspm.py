@@ -202,7 +202,7 @@ def test_offline_mode_blocks_live_gemini_and_contained_skips_gemini():
             assert "aws_kms_key.payment_key.arn" in rem.remediated_code
             mock_post.assert_not_called()
 
-            consensus = MultiAgentConsensusEngine(offline_mode=False)
+            consensus = MultiAgentConsensusEngine(offline_mode=False, allow_external_llm=True)
             res = consensus.run_consensus_evaluation({"id": "AP-CONTAINED"})
             assert res["arbiter"]["cvss_v4_score"] == 0.0
             mock_post.assert_not_called()
@@ -314,7 +314,7 @@ def test_clean_baseline_vs_posture_findings_consensus_and_real_live_arns():
 def test_ai_fallback_error_is_surfaced_in_diagnostics(capsys):
     with patch.dict(os.environ, {"GEMINI_API_KEY": "bad-key"}):
         with patch("requests.post", side_effect=RuntimeError("Quota exceeded")):
-            rc = run_scan(live_demo=True, offline_mode=False, format_type="json")
+            rc = run_scan(live_demo=True, offline_mode=False, format_type="json", allow_external_llm=True)
             assert rc == 1
             data = json.loads(capsys.readouterr().out)
             warnings = data["ai_diagnostics"]["warnings"]
@@ -635,7 +635,7 @@ spec:
 
     with patch.dict(os.environ, {"GEMINI_API_KEY": "fake-key"}):
         with patch("requests.post", return_value=_FakeResp()):
-            run_scan(live_demo=True, offline_mode=False, format_type="json")
+            run_scan(live_demo=True, offline_mode=False, format_type="json", allow_external_llm=True)
             diag_data = json.loads(capsys.readouterr().out)
             assert any("empty remediated_code" in w for w in diag_data["ai_diagnostics"]["warnings"])
 
@@ -2249,7 +2249,7 @@ def test_gemini_prompt_grounding_retry_and_post_llm_guardrail():
     with patch("time.sleep") as mock_sleep:
         with patch("requests.post", side_effect=[resp_503, resp_200]) as mock_post:
             with patch.dict(os.environ, {"GEMINI_API_KEY": "test-key"}):
-                engine = AIRemediationEngine(offline_mode=False)
+                engine = AIRemediationEngine(offline_mode=False, allow_external_llm=True)
                 ap = AttackPath(id="AP-001", title="T", nodes=s3_nodes, steps=["s1"], root_cause="rc", impact="imp")
                 rem = engine.synthesize_remediation(ap)
                 assert mock_post.call_count == 2
@@ -2944,6 +2944,173 @@ resource "aws_iam_policy" "target_flawed_policy" {
     # Secrets in the target block must be redacted
     assert "fake_token_value_abc_123" not in code
     assert "[REDACTED_BY_AI_CSPM]" in code
+
+
+def test_multi_asset_remediation_grouping_and_hcl2():
+    import hcl2
+    from ai.prompt_templates import build_scoped_kms_policy_hcl, collect_group_pairs
+    from core.models import AttackPath
+
+    # 3 KMS Keys & 3 S3 Buckets
+    nodes = [
+        {"type": "IAM_ROLE", "name": "payment_role"},
+        {"type": "IAM_POLICY", "name": "OverprivilegedKmsPolicy"},
+        {"type": "KMS_KEY", "name": "k0"},
+        {"type": "S3_BUCKET", "name": "b0"},
+    ]
+    group_members = [
+        [{"type": "KMS_KEY", "name": f"k{i}"}, {"type": "S3_BUCKET", "name": f"b{i}"}]
+        for i in range(3)
+    ]
+
+    pairs = collect_group_pairs(nodes, group_members)
+    assert len(pairs) == 3
+
+    hcl = build_scoped_kms_policy_hcl(nodes, group_members=group_members)
+    assert "ScopedKeyDecryption1" in hcl
+    assert "ScopedKeyDecryption2" in hcl
+    assert "ScopedKeyDecryption3" in hcl
+    assert "aws_kms_key.k0.arn" in hcl
+    assert "aws_kms_key.k1.arn" in hcl
+    assert "aws_kms_key.k2.arn" in hcl
+    assert "aws_iam_role_policy_attachment" in hcl
+
+    # Must be valid HCL parseable by hcl2
+    parsed = hcl2.loads(hcl)
+    assert "resource" in parsed
+    resources = parsed["resource"]
+    res_types = [list(r.keys())[0] for r in resources]
+    assert "aws_iam_policy" in res_types
+    assert "aws_iam_role_policy_attachment" in res_types
+
+    # S3 identity policy with multi-pairs
+    s3_nodes = [
+        {"type": "IAM_ROLE", "name": "storage_role"},
+        {"type": "IAM_POLICY", "name": "OverprivilegedS3Policy"},
+        {"type": "S3_BUCKET", "name": "b0"},
+    ]
+    s3_group_members = [
+        [{"type": "S3_BUCKET", "name": f"b{i}"}]
+        for i in range(3)
+    ]
+    s3_hcl = build_scoped_kms_policy_hcl(s3_nodes, group_members=s3_group_members)
+    assert "ScopedStorageAccessOnly" in s3_hcl
+    assert "aws_s3_bucket.b0.arn" in s3_hcl
+    assert "aws_s3_bucket.b1.arn" in s3_hcl
+    assert "aws_s3_bucket.b2.arn" in s3_hcl
+    parsed_s3 = hcl2.loads(s3_hcl)
+    assert "resource" in parsed_s3
+
+
+def test_sanitize_for_llm_privacy_redactions():
+    from ai.engine import sanitize_for_llm, REDACTED
+
+    raw_text = (
+        'database_url = "postgres://admin:hunter2@db.internal:5432/app"\n'
+        'secret_key = <<-EOF\n'
+        'my_super_secret_token_value_abc\n'
+        'EOF\n'
+        'kms_key_arn = "arn:aws:secretsmanager:us-east-1:123456789012:secret:db-password-XYZ"\n'
+        'api_key = "ghp_123456789012345678901234567890123456"\n'
+        'auth_header = "Bearer eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.e30.abcdef12345"\n'
+    )
+
+    sanitized = sanitize_for_llm(raw_text)
+
+    # Passwords in URLs redacted
+    assert "hunter2" not in sanitized
+    assert f"admin:{REDACTED}@" in sanitized
+
+    # Heredoc secret redacted
+    assert "my_super_secret_token_value_abc" not in sanitized
+
+    # GitHub token redacted
+    assert "ghp_123456789012345678901234567890123456" not in sanitized
+
+    # Bearer token redacted
+    assert "abcdef12345" not in sanitized
+
+    # Critical: ARNs containing secret hints like 'password' or 'secret' are preserved!
+    assert "arn:aws:secretsmanager:us-east-1:123456789012:secret:db-password-XYZ" in sanitized
+
+
+def test_read_original_policy_withheld_message(tmp_path):
+    from ai.engine import AIRemediationEngine
+    from core.models import AttackPath
+
+    tf_file = tmp_path / "other_resources.tf"
+    tf_file.write_text(
+        'resource "aws_vpc" "main_vpc" {\n'
+        '  cidr_block = "10.0.0.0/16"\n'
+        '}\n',
+        encoding="utf-8"
+    )
+
+    engine = AIRemediationEngine(offline_mode=True)
+    ap = AttackPath(
+        id="AP-MISSING",
+        title="Missing Block",
+        nodes=[{"type": "IAM_POLICY", "name": "non_existent_policy", "source_file": str(tf_file)}],
+        steps=["s1"],
+        root_cause="rc",
+        impact="imp"
+    )
+
+    code = engine._read_original_policy_code(ap)
+    assert "# [AI-CSPM] affected resource block not located; file content withheld from external LLM" in code
+    assert "10.0.0.0/16" not in code
+
+
+def test_live_scan_id_collision_promoted_to_parse_error():
+    from unittest.mock import patch, MagicMock
+    from ai_cspm import run_scan
+    from core.models import IAMRoleNode
+
+    # Create two different roles that collide on id
+    r1 = IAMRoleNode(id="aws:iam:role:app_role", name="app_role", role_arn="arn:aws:iam::111:role/app_role", source_file="aws://iam/role/app_role")
+    r2 = IAMRoleNode(id="aws:iam:role:app_role", name="different_role", role_arn="arn:aws:iam::111:role/different_role", source_file="aws://iam/role/different_role")
+
+    with patch("ai_cspm._resolve_aws_session", return_value=(MagicMock(), "us-east-1", False)), \
+         patch("ai_cspm._verify_aws_credentials", return_value=(True, "arn:aws:iam::111:root")):
+        with patch("ai_cspm.LiveCloudFetcher") as mock_fetcher_cls:
+            fetcher = MagicMock()
+            mock_fetcher_cls.return_value = fetcher
+            fetcher.prompt_k8s_configuration.return_value = ("ctx", "default")
+            fetcher.workloads = []
+            fetcher.service_accounts = []
+            fetcher.roles = [r1, r2]
+            fetcher.policies = []
+            fetcher.kms_keys = []
+            fetcher.s3_buckets = []
+            fetcher.attachments = []
+            fetcher.warnings = []
+
+            # In live scan, this collision must be treated as fatal parse error (exit code 2)
+            rc = run_scan(live_mode=True, offline_mode=True, format_type="json")
+            assert rc == 2
+
+
+def test_explicit_external_llm_consent_flag():
+    import os
+    from unittest.mock import patch
+    from ai.engine import AIRemediationEngine
+    from ai.multi_agent_consensus import MultiAgentConsensusEngine
+
+    with patch.dict(os.environ, {"GEMINI_API_KEY": "AIzaSySecretApiKey123"}):
+        # Default: allow_external_llm=False -> gemini_key must be empty!
+        engine_default = AIRemediationEngine(offline_mode=False)
+        assert engine_default.gemini_key == ""
+
+        consensus_default = MultiAgentConsensusEngine(offline_mode=False)
+        assert consensus_default.gemini_key == ""
+
+        # Explicit opt-in: allow_external_llm=True -> gemini_key must be set
+        engine_optin = AIRemediationEngine(offline_mode=False, allow_external_llm=True)
+        assert engine_optin.gemini_key == "AIzaSySecretApiKey123"
+
+        consensus_optin = MultiAgentConsensusEngine(offline_mode=False, allow_external_llm=True)
+        assert consensus_optin.gemini_key == "AIzaSySecretApiKey123"
+
 
 
 

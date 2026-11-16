@@ -40,11 +40,62 @@ except (ImportError, ValueError):
     )
 
 
+REDACTED = "[REDACTED_BY_AI_CSPM]"
+_SECRET_KEY_HINTS = ("password", "passwd", "secret", "token", "private_key", "apikey", "api_key",
+                     "credential", "connection_string", "access_key")
+_REFERENCE_PREFIXES = ("arn:", "var.", "local.", "data.", "aws_", "module.", "each.", "${")
+
+
+def sanitize_for_llm(text: str) -> str:
+    if not text:
+        return text
+    masked = re.sub(r"\b(?:AKIA|ABIA|ACCA|ASIA)[A-Z0-9]{16}\b", REDACTED, text)
+    masked = re.sub(r"\bgh[pousr]_[A-Za-z0-9]{36,}\b", REDACTED, masked)
+    masked = re.sub(r"\bgithub_pat_[A-Za-z0-9_]{20,}\b", REDACTED, masked)
+    masked = re.sub(r"\bBearer\s+[A-Za-z0-9_\-\.]{20,}", f"Bearer {REDACTED}", masked, flags=re.IGNORECASE)
+    masked = re.sub(r"-----BEGIN (?:[A-Z]+ )*PRIVATE KEY-----.*?-----END (?:[A-Z]+ )*PRIVATE KEY-----",
+                    REDACTED, masked, flags=re.DOTALL)
+    masked = re.sub(r"(://[^/\s:@\"']+:)[^/\s@\"']+(@)",
+                    lambda m_: f"{m_.group(1)}{REDACTED}{m_.group(2)}", masked)
+    hints = "|".join(re.escape(h) for h in _SECRET_KEY_HINTS)
+    masked = re.sub(rf"((?:{hints})[\w\.\-]*\s*=\s*)<<-?\s*(\w+)\n.*?\n\s*\2\b",
+                    lambda m_: f'{m_.group(1)}"{REDACTED}"', masked, flags=re.DOTALL | re.IGNORECASE)
+
+    arns: list = []                      # احمِ الـ ARN قبل الحجب النصي
+    def _stash_arn(m_):
+        arns.append(m_.group(0))
+        return f"\x00ARN{len(arns) - 1}\x00"
+    masked = re.sub(r"arn:[^\s\"',]+", _stash_arn, masked)
+
+    def _inline(m_):
+        value = m_.group(2)
+        if REDACTED in value or value.startswith(_REFERENCE_PREFIXES) or value.lower() in ("true", "false", "null"):
+            return m_.group(0)
+        return f"{m_.group(1)}{REDACTED}"
+    masked = re.sub(rf"(?i)(\b[\w\-]*(?:{hints})[\w\-]*\s*[=:]\s*)([^\s\"',}}\]\x00]+)", _inline, masked)
+    masked = re.sub(r"\x00ARN(\d+)\x00", lambda m_: arns[int(m_.group(1))], masked)
+
+    out = []
+    for line in masked.splitlines():
+        m_ = re.match(r'^(\s*)("?[\w\.\-\[\]]+"?)\s*([=:])\s*(.*)$', line)
+        if m_ and any(h in m_.group(2).lower() for h in _SECRET_KEY_HINTS):
+            value = m_.group(4).strip().rstrip(",").strip().strip('"').strip("'")
+            if (value == "" or REDACTED in value or value.lower() in ("true", "false", "null")
+                    or value.startswith(_REFERENCE_PREFIXES) or value[:1] in "{[<"):
+                out.append(line)
+                continue
+            out.append(f'{m_.group(1)}{m_.group(2)} {m_.group(3)} "{REDACTED}"')
+            continue
+        out.append(line)
+    return "\n".join(out)
+
+
 class AIRemediationEngine:
-    def __init__(self, model_provider: str = "auto", offline_mode: bool = False):
+    def __init__(self, model_provider: str = "auto", offline_mode: bool = False, allow_external_llm: bool = False):
         self.provider = model_provider
         self.offline_mode = offline_mode
-        self.gemini_key = "" if offline_mode else load_env_secret("GEMINI_API_KEY")
+        self.allow_external_llm = allow_external_llm
+        self.gemini_key = "" if (offline_mode or not allow_external_llm) else load_env_secret("GEMINI_API_KEY")
         self.model_name, self.timeout = load_gemini_config()
         self.api_endpoint = f"https://generativelanguage.googleapis.com/v1beta/models/{self.model_name}:generateContent"
         self.last_error: Optional[str] = None
@@ -104,24 +155,7 @@ class AIRemediationEngine:
             return None
 
         def _sanitize_for_llm(text: str) -> str:
-            """Masks secrets, passwords, access keys, private keys, and tokens from code before passing to external LLM."""
-            if not text:
-                return text
-            masked = re.sub(r"\b(AKIA|ABIA|ACCA|ASIA)[A-Z0-9]{16}\b", "[REDACTED_BY_AI_CSPM]", text)
-            masked = re.sub(r"\bghp_[a-zA-Z0-9]{36}\b", "[REDACTED_BY_AI_CSPM]", masked)
-            masked = re.sub(r"\bBearer\s+[a-zA-Z0-9_\-\.]{20,}\b", "Bearer [REDACTED_BY_AI_CSPM]", masked, flags=re.IGNORECASE)
-            masked = re.sub(r"-----BEGIN (?:RSA |EC |DSA |OPENSSH )?PRIVATE KEY-----.*?-----END (?:RSA |EC |DSA |OPENSSH )?PRIVATE KEY-----", "[REDACTED_BY_AI_CSPM]", masked, flags=re.DOTALL)
-
-            sanitized_lines = []
-            for line in masked.splitlines():
-                lower_l = line.lower()
-                if any(sec in lower_l for sec in ("password", "secret", "access_token", "private_key", "apikey", "api_key", "token")):
-                    if "=" in line or ":" in line:
-                        parts = re.split(r"(=|:)", line, maxsplit=1)
-                        sanitized_lines.append(f"{parts[0]}{parts[1]} \"[REDACTED_BY_AI_CSPM]\"")
-                        continue
-                sanitized_lines.append(line)
-            return "\n".join(sanitized_lines)
+            return sanitize_for_llm(text)
 
         if source_file and os.path.exists(source_file) and source_file.endswith((".tf", ".json")):
             try:
@@ -147,13 +181,14 @@ class AIRemediationEngine:
                                         c_txt = cf.read()
                                     if expected_kw in c_txt:
                                         block = _find_hcl_block_span(c_txt, target_name, expected_kw) or _find_hcl_block_span(c_txt, "", expected_kw)
-                                        return _sanitize_for_llm(block or c_txt)
+                                        if block:
+                                            return _sanitize_for_llm(block)
                                 except Exception:
                                     pass
                     block = _find_hcl_block_span(content, target_name, expected_kw)
                     if block:
                         return _sanitize_for_llm(block)
-                    return _sanitize_for_llm(content)
+                    return "# [AI-CSPM] affected resource block not located; file content withheld from external LLM"
             except Exception:
                 pass
 
@@ -164,7 +199,7 @@ class AIRemediationEngine:
                 block = _find_hcl_block_span(content, target_name)
                 if block:
                     return _sanitize_for_llm(block)
-                return _sanitize_for_llm(content)
+                return "# [AI-CSPM] affected resource block not located; file content withheld from external LLM"
             except Exception:
                 pass
 
@@ -253,7 +288,7 @@ class AIRemediationEngine:
         """High-precision dynamic contextual rule-based AI synthesizer (Zero-Dependency & 100% Reliable)."""
         vector_type = detect_attack_path_vector(attack_path.nodes)
         workload_name, _, key_name, bucket_name, _ = extract_target_refs(attack_path.nodes)
-        remediated_hcl = build_scoped_kms_policy_hcl(attack_path.nodes)
+        remediated_hcl = build_scoped_kms_policy_hcl(attack_path.nodes, group_members=getattr(attack_path, "group_members", None))
 
         if vector_type == "s3_resource_policy":
             explanation = (

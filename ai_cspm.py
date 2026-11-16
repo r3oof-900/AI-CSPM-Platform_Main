@@ -48,6 +48,7 @@ from ingestion.aws_json_parser import AwsJsonParser
 from ingestion.live_cloud_parser import LiveCloudFetcher
 from ai.engine import AIRemediationEngine
 from ai.multi_agent_consensus import MultiAgentConsensusEngine
+from ai.prompt_templates import collect_group_pairs
 from core.reporter import apply_auto_remediation, generate_html_report, generate_interactive_graph_html
 
 console = Console(highlight=False, emoji=False)
@@ -111,7 +112,8 @@ def run_scan(
     k8s_ca_cert: Optional[str] = None,
     k8s_insecure: bool = False,
     strict: bool = False,
-    allow_empty: bool = False
+    allow_empty: bool = False,
+    allow_external_llm: bool = False
 ) -> int:
     cg = ContextualGraph()
     source_description = ""
@@ -189,6 +191,7 @@ def run_scan(
         )
         analyzer = AttackPathAnalyzer(cg, tf_parser=None, k8s_parser=fetcher)
         parse_warnings.extend(getattr(fetcher, "warnings", []))
+        parse_errors.extend(w for w in getattr(cg, "warnings", []) if "ID collision" in w)
 
     else:
         # Static IaC Directory Scan
@@ -308,11 +311,11 @@ def run_scan(
 
     # 3. Discovered Assets Table
     if format_type == "console":
-        table = Table(title="📊 Discovered Multi-Tier Assets", border_style="cyan")
-        table.add_column("Layer", style="bold magenta", width=16)
-        table.add_column("Node Type", style="cyan", width=20)
-        table.add_column("Asset Name / Identifier", style="bold white")
-        table.add_column("Source Context", style="dim")
+        table = Table(title="📊 Discovered Multi-Tier Assets", border_style="cyan", show_lines=True, expand=True)
+        table.add_column("Layer", style="bold magenta", no_wrap=True)
+        table.add_column("Node Type", style="cyan", no_wrap=True)
+        table.add_column("Asset Name / Identifier", style="bold white", overflow="fold")
+        table.add_column("Source Context", style="dim", overflow="fold")
 
         for node_id, data in cg.graph.nodes(data=True):
             src = data.get("source_file", "in-memory")
@@ -427,7 +430,7 @@ def run_scan(
                 pass
 
     if not (is_aicspm_snapshot and remediations):
-        ai_engine = AIRemediationEngine(offline_mode=offline_mode)
+        ai_engine = AIRemediationEngine(offline_mode=offline_mode, allow_external_llm=allow_external_llm)
         remediations = []
         remediation_providers = []
         remediation_warnings = []
@@ -523,33 +526,24 @@ def run_scan(
                 console.print(Syntax(ap_remediation.remediated_code, "terraform", theme="monokai", line_numbers=True))
                 console.print(f"\n[bold green]✔ Containment Score:[/] {ap_remediation.risk_reduction}")
 
-                # Benchmark Matrix
-                comp_table = Table(title="🔬 Architectural Gap Analysis: Why Single-Layer Scanners Miss Cross-Layer Chains", border_style="yellow")
-                comp_table.add_column("Scanner Category", style="bold white", width=25)
-                comp_table.add_column("Detection Scope", style="bold red", width=22)
-                comp_table.add_column("Architectural Limitation", style="dim")
-
-                comp_table.add_row("Cloud IAM Scanners", "Isolated Policy Syntax", "Evaluates policy syntax and global admin wildcards; blind to K8s OIDC pod token links")
-                comp_table.add_row("Kubernetes Scanners", "In-Cluster Boundaries", "Halts at K8s cluster boundary; cannot traverse STS AssumeRole to KMS and S3")
-                comp_table.add_row("Access Analyzers", "Grammar & Policies", "Validates syntax and reachable resources; misses multi-tier chained trust paths")
-                comp_table.add_row("Standard IaC Linters", "Siloed Resource Files", "Separates K8s YAML and Terraform into isolated files without building a unified DAG")
-                comp_table.add_row("Contextual AI-CSPM", "[bold green]DETECTED & REMEDIATED[/]", "Synthesizes cross-layer DAG: K8s Workload -> IRSA -> IAM Role -> KMS CMK -> S3 Vault")
-
-                console.print(comp_table)
-
     # 5. Security Misconfigurations Table
     if format_type == "console":
         console.print("\n[bold cyan]🛡️ ═══════════════════════════════════════════════════════════════════ 🛡️[/]")
         console.print("[bold cyan]       COMPREHENSIVE MULTI-TIER MISCONFIGURATIONS & POSTURE AUDIT       [/]")
         console.print("[bold cyan]🛡️ ═══════════════════════════════════════════════════════════════════ 🛡️\n[/]")
 
-        m_table = Table(title=f"📋 All Discovered Misconfigurations ({len(misconfigs)} Findings)", border_style="blue")
-        m_table.add_column("Rule ID", style="bold white", width=14)
-        m_table.add_column("Sev", style="bold", width=8)
-        m_table.add_column("Layer", style="magenta", width=12)
-        m_table.add_column("Title & Security Defect", style="white", width=32)
-        m_table.add_column("Target Resource", style="cyan", width=18)
-        m_table.add_column("Compliance Mapping", style="dim", width=22)
+        m_table = Table(
+            title=f"📋 All Discovered Misconfigurations ({len(misconfigs)} Findings)",
+            border_style="blue",
+            show_lines=True,
+            expand=True
+        )
+        m_table.add_column("Rule ID", style="bold white", no_wrap=True)
+        m_table.add_column("Sev", style="bold", no_wrap=True)
+        m_table.add_column("Layer", style="magenta", no_wrap=True)
+        m_table.add_column("Title & Security Defect", style="white", overflow="fold", ratio=3)
+        m_table.add_column("Target Resource", style="cyan", overflow="fold", ratio=2)
+        m_table.add_column("Compliance Mapping", style="dim", overflow="fold", ratio=2)
 
         for m in misconfigs:
             sev_color = "red" if m.severity.value == "CRITICAL" else "yellow" if m.severity.value == "HIGH" else "cyan"
@@ -576,7 +570,7 @@ def run_scan(
         consensus_data = loaded_snapshot_data["consensus"]
         consensus_warn = None
     else:
-        consensus_engine = MultiAgentConsensusEngine(offline_mode=offline_mode)
+        consensus_engine = MultiAgentConsensusEngine(offline_mode=offline_mode, allow_external_llm=allow_external_llm)
         path_payload = attack_paths[0].model_dump() if attack_paths else {
             "id": "AP-CONTAINED",
             "title": "Hardened Baseline Verification",
@@ -716,10 +710,29 @@ def run_scan(
                 ))
         else:
             patched_files = []
+            grouped_rems = []
             for ap, rem in zip(attack_paths, remediations):
+                if len(collect_group_pairs(ap.nodes, getattr(ap, "group_members", None))) > 1:
+                    grouped_rems.append(rem)      # لا تضيّق في مكانها: ستحجب بقية الأصول
+                    continue
                 patch_file = apply_auto_remediation(target_dir, rem, attack_path=ap)
                 if patch_file and patch_file not in patched_files:
                     patched_files.append(patch_file)
+            if grouped_rems:
+                g_dir = os.path.dirname(target_dir) if os.path.isfile(target_dir) else target_dir
+                g_file = os.path.join(g_dir, "remediated_grouped_least_privilege.tf")
+                seen_g, blocks_g = set(), []
+                for r in grouped_rems:
+                    for blk in re.split(r'\n(?=resource\s+")', (r.remediated_code or "").strip()):
+                        m = re.match(r'resource\s+"([^"]+)"\s+"([^"]+)"', blk.strip())
+                        k_ = (m.group(1), m.group(2)) if m else blk.strip()
+                        if blk.strip() and k_ not in seen_g:
+                            seen_g.add(k_)
+                            blocks_g.append(blk.strip())
+                with open(g_file, "w", encoding="utf-8") as f:
+                    f.write("# Multi-asset remediation: review, apply, then detach the original wildcard policy.\n\n"
+                            + "\n\n".join(blocks_g))
+                patched_files.append(g_file)
             if not patched_files and ((aws_json and getattr(aws_json, "roles", None)) or is_aicspm_snapshot):
                 patch_dir = os.path.dirname(target_dir) if os.path.isfile(target_dir) else target_dir
                 snap_patch = os.path.join(patch_dir, "remediated_snapshot_least_privilege.tf")
@@ -906,6 +919,11 @@ Examples:
         help="Allow empty scan target without exiting with error code 2"
     )
     parser.add_argument(
+        "--allow-external-llm",
+        action="store_true",
+        help="Explicit consent to send redacted resource blocks to Google Gemini (requires GEMINI_API_KEY). Off by default."
+    )
+    parser.add_argument(
         "--version",
         "-v",
         action="version",
@@ -940,7 +958,8 @@ Examples:
         k8s_ca_cert=args.k8s_ca_cert,
         k8s_insecure=args.k8s_insecure,
         strict=args.strict,
-        allow_empty=args.allow_empty
+        allow_empty=args.allow_empty,
+        allow_external_llm=args.allow_external_llm
     )
     sys.exit(exit_code)
 

@@ -122,9 +122,7 @@ resource "aws_iam_role" "eks_payment_kms_role" {
   }
 }
 
-# ==============================================================================
-# 4. Overprivileged IAM Policy (The Research Gap Flaw: Resource = "*")
-# ==============================================================================
+
 resource "aws_iam_policy" "overprivileged_kms_policy" {
   name        = "OverprivilegedPaymentKmsPolicy"
   description = "Flawed policy granting wildcard KMS Decrypt across all keys instead of least-privilege target key"
