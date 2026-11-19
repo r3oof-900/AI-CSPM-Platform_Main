@@ -137,7 +137,15 @@ resource "aws_iam_policy" "overprivileged_kms_policy" {
           "kms:Decrypt",
           "kms:DescribeKey"
         ]
-        Resource = "*"
+        # REMEDIATED BY AI-CSPM: Scoped down from wildcard '*' to explicit Customer Managed Key
+        Resource = aws_kms_key.payment_key.arn
+
+        # REMEDIATED BY AI-CSPM: Cryptographically bound to target S3 storage vault
+        Condition = {
+          StringEquals = {
+            "kms:EncryptionContext:aws:s3:arn" = aws_s3_bucket.payment_vault.arn
+          }
+        }
       }
     ]
   })
